@@ -7,12 +7,11 @@ from __future__ import annotations
 import json
 import os
 import sys
-import traceback
-from datetime import datetime, timezone
 from pathlib import Path
 
 from .config import Thresholds, learned_home, project_name
 from .fsutil import atomic_write_text, create_numbered
+from .logutil import log_line
 from .models import Candidate
 from .redact import redact
 from .store import Store
@@ -21,18 +20,7 @@ from .transcript import extract_windows
 
 def log_error(home: Path, what: str, exc: BaseException | None = None) -> None:
     """Append a one-line timestamped entry to <store>/capture.log. Never raises."""
-    try:
-        detail = ""
-        if exc is not None:
-            tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
-            detail = " | " + " / ".join(l.strip() for l in tb.splitlines() if l.strip())
-        stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        line = f"{stamp} {what}{detail}".replace("\r", " ").replace("\n", " ")
-        Path(home).mkdir(parents=True, exist_ok=True)
-        with open(Path(home) / "capture.log", "a", encoding="utf-8", newline="\n") as f:
-            f.write(line + "\n")
-    except Exception:
-        pass
+    log_line(home, "capture.log", what, exc)
 
 
 def _read_watermark(path: Path) -> int:
