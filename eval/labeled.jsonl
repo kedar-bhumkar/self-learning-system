@@ -1,0 +1,14 @@
+# SYNTHETIC EXAMPLE DATA ONLY (fake facts). Replace with real labels; schema is in eval/run_eval.py docstring.
+{"mode":"capture","text":"Rejected uv, use pip because corporate proxy","context":"Shall I install with uv?","expected_kind":"rejection"}
+{"mode":"capture","text":"Let's go with option B, the sqlite store","context":"Option A: json files. Option B: sqlite.","expected_kind":"decision"}
+{"mode":"capture","text":"I always want tables as markdown, never ascii art","context":"Here is the summary.","expected_kind":"preference"}
+{"mode":"capture","text":"No, that is wrong, the config lives in settings.toml","context":"I edited config.yaml.","expected_kind":"correction"}
+{"mode":"capture","text":"please run the tests","context":"Done editing.","expected_kind":"none"}
+{"mode":"capture","text":"thanks, looks good","context":"All done.","expected_kind":"none"}
+{"mode":"dedupe","a":"Use pip, not uv, behind the corporate proxy","b":"Do not use uv here; pip works with the proxy","same":true}
+{"mode":"dedupe","a":"Use pip, not uv, behind the corporate proxy","b":"Prefer markdown tables in summaries","same":false}
+{"mode":"tag","text":"Use pip instead of uv","tags":{"python-tooling":"Python package tooling","docs":"Documentation style"},"expected":"python-tooling"}
+{"mode":"tag","text":"Deploy with the blue-green script","tags":{"python-tooling":"Python package tooling","docs":"Documentation style"},"expected":null}
+{"mode":"promote","texts":["Prefer markdown tables","Use markdown tables in summaries"],"expected":"global"}
+{"mode":"promote","texts":["Use pip behind the proxy in project alpha","Use pip behind the proxy in project beta"],"expected":"topic"}
+{"mode":"promote","texts":["Project alpha uses port 8080","Project beta uses port 9090"],"expected":"none"}
