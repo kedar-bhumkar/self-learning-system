@@ -8,7 +8,7 @@ from pathlib import Path
 from .fsutil import atomic_write_text
 from .records import Record, parse_record, render_record
 
-_IGNORE_LINES = [".lock", "inbox/.done/", "capture.log"]
+_IGNORE_LINES = [".lock", "inbox/.done/", "capture.log", "consolidate.log"]
 _SCOPE_DIRS = {"global": "global", "topic": "topics"}
 
 
