@@ -8,6 +8,7 @@ from pathlib import Path
 from .models import Window
 
 CONTEXT_MAX = 1500
+QUESTION_MAX = 800  # budget for an AskUserQuestion's text + options inside CONTEXT_MAX
 _SKIP_PREFIXES = ("<system-reminder>", "<local-command", "<command-name>")
 _PASTED = re.compile(r"<pasted_content\b[^>]*>.*?</pasted_content>", re.DOTALL)
 _REMINDER = re.compile(r"<system-reminder>.*?(?:</system-reminder>|\Z)", re.DOTALL)
@@ -47,6 +48,7 @@ def _result_text(content) -> str:
 def extract_windows(path: Path) -> list[Window]:
     windows: list[Window] = []
     context = ""
+    full_context = ""  # untruncated assistant text, for budgeting question windows
     ask_ids: dict[str, str] = {}  # AskUserQuestion tool_use id -> question text
     try:
         fh = open(path, "r", encoding="utf-8", errors="replace")
@@ -74,6 +76,7 @@ def extract_windows(path: Path) -> list[Window]:
             if kind == "assistant":
                 text = _text_of(blocks).strip()
                 if text:
+                    full_context = text
                     context = text[:CONTEXT_MAX]
                 for b in blocks:
                     if b.get("type") == "tool_use" and b.get("name") == "AskUserQuestion" \
@@ -85,8 +88,10 @@ def extract_windows(path: Path) -> list[Window]:
                 if b.get("type") == "tool_result" and b.get("tool_use_id") in ask_ids:
                     answer = _result_text(b.get("content")).strip()
                     if answer:
-                        ctx = (context + "\n" + ask_ids[b["tool_use_id"]]).strip()
-                        windows.append(Window(answer, ctx[:CONTEXT_MAX], True, ts, line_no))
+                        q = ask_ids[b["tool_use_id"]][:QUESTION_MAX]
+                        tail = full_context[-(CONTEXT_MAX - len(q) - 1):]
+                        ctx = (tail + "\n" + q).strip()
+                        windows.append(Window(answer, ctx, True, ts, line_no))
             text = _PASTED.sub("", _text_of(blocks)).strip()
             if not text or text.startswith(_SKIP_PREFIXES):
                 continue

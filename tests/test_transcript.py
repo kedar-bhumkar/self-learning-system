@@ -120,3 +120,25 @@ def test_system_reminder_blocks_and_spans_removed(tmp_path):
     texts = [w.text for w in extract_windows(p)]
     assert texts == ["real one", "real two", "real three  tail", "real four"]
     assert all("noise" not in t and "multi" not in t for t in texts)
+
+
+def _ask(tmp_path, preceding):
+    q = {"questions": [{"question": "Which db?", "options": ["SQLite", "Postgres"]}]}
+    return extract_windows(write(tmp_path, [
+        line("assistant", [{"type": "text", "text": preceding},
+                           {"type": "tool_use", "id": "q1", "name": "AskUserQuestion",
+                            "input": q}]),
+        line("user", [{"type": "tool_result", "tool_use_id": "q1", "content": "SQLite"}]),
+    ]))
+
+
+def test_ask_question_survives_long_preceding_context(tmp_path):
+    (w,) = _ask(tmp_path, "intro " * 400 + "TAILMARK")
+    assert len(w.context) <= 1500
+    assert "Which db?" in w.context and "Postgres" in w.context
+    assert "TAILMARK" in w.context
+
+
+def test_ask_short_context_unchanged(tmp_path):
+    (w,) = _ask(tmp_path, "pick one")
+    assert w.context.startswith("pick one" + chr(10) + "{") and "Which db?" in w.context
