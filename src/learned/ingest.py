@@ -163,6 +163,7 @@ def ingest(store: Store, judge, embedder, th: Thresholds, now: str) -> IngestRep
             target.sources = [*target.sources, c.session_id]
         if not target.pinned:
             target.last_seen = now
+            target.stale = False
         store.save(target)
         rep.merged.append((cand_id, target.id))
         touch(target)
