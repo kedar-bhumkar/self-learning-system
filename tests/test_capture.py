@@ -164,3 +164,59 @@ def test_unicode_text_roundtrip(tmp_path, store):
     t = make_transcript(tmp_path, ["no café ☕ \U0001F600", "b", "c"])
     capture_session(t, "s", str(work(tmp_path)), FakeJudge(classify_window=rejecting), store)
     assert cands(store)[0].text == "no café ☕ \U0001F600"
+
+
+def test_main_without_api_key_stores_unclassified(tmp_path, monkeypatch):
+    from learned import capture
+    monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)
+    home = tmp_path / "home"
+    monkeypatch.setenv("LEARNED_HOME", str(home))
+    t = make_transcript(tmp_path, ["no not X", "use Y", "ok"])
+    cwd = work(tmp_path)
+    assert capture.main([str(t), "sid", str(cwd)]) == 0
+    cs = cands(Store(home))
+    assert [c.text for c in cs] == ["no not X", "use Y", "ok"]
+    assert all(c.kind is None for c in cs)
+    log = (home / "capture.log").read_text(encoding="utf-8")
+    assert "judge failed" in log and len(log.splitlines()) == 1
+
+
+def test_main_logs_programming_errors_and_exits_zero(tmp_path, monkeypatch):
+    from learned import capture
+    home = tmp_path / "home"
+    monkeypatch.setenv("LEARNED_HOME", str(home))
+
+    def boom(path):
+        raise KeyError("kaboom")
+
+    monkeypatch.setattr(capture, "extract_windows", boom)
+    assert capture.main([str(tmp_path / "t.jsonl"), "sid", str(tmp_path)]) == 0
+    lines = (home / "capture.log").read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1
+    assert "KeyError" in lines[0] and "kaboom" in lines[0] and lines[0][:4].isdigit()
+    assert capture.main(["too", "few"]) == 0
+    assert len((home / "capture.log").read_text(encoding="utf-8").splitlines()) == 2
+
+
+def test_capture_log_is_gitignored_in_store(tmp_path, monkeypatch):
+    from learned import capture
+    capture.log_error(tmp_path, "x")
+    s = Store(tmp_path)
+    s.init()
+    s.commit("c")
+    tracked = __import__("subprocess").run(["git", "-C", str(tmp_path), "ls-files"],
+                                           capture_output=True, text=True).stdout
+    assert "capture.log" not in tracked
+
+
+def test_two_workers_same_session_do_not_overwrite(tmp_path, store):
+    t = make_transcript(tmp_path, ["one", "two", "three"])
+    cwd = str(work(tmp_path))
+    j = FakeJudge(classify_window=rejecting)
+    assert capture_session(t, "s", cwd, j, store) == 3
+    # a second worker that started before the first wrote its watermark sees the same windows
+    (store.home / "inbox" / ".done" / "s.json").unlink()
+    assert capture_session(t, "s", cwd, j, store) == 3
+    files = sorted(f.name for f in (store.home / "inbox").glob("*.jsonl"))
+    assert files == ["s.1.jsonl", "s.jsonl"]
+    assert not list((store.home / "inbox").glob("*.tmp"))

@@ -7,19 +7,32 @@ from __future__ import annotations
 import json
 import os
 import sys
+import traceback
+from datetime import datetime, timezone
 from pathlib import Path
 
 from .config import Thresholds, learned_home, project_name
+from .fsutil import atomic_write_text, create_numbered
 from .models import Candidate
 from .redact import redact
 from .store import Store
 from .transcript import extract_windows
 
 
-def _atomic_write(path: Path, text: str) -> None:
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(text, encoding="utf-8", newline="\n")
-    os.replace(tmp, path)
+def log_error(home: Path, what: str, exc: BaseException | None = None) -> None:
+    """Append a one-line timestamped entry to <store>/capture.log. Never raises."""
+    try:
+        detail = ""
+        if exc is not None:
+            tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+            detail = " | " + " / ".join(l.strip() for l in tb.splitlines() if l.strip())
+        stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        line = f"{stamp} {what}{detail}".replace("\r", " ").replace("\n", " ")
+        Path(home).mkdir(parents=True, exist_ok=True)
+        with open(Path(home) / "capture.log", "a", encoding="utf-8", newline="\n") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
 
 
 def _read_watermark(path: Path) -> int:
@@ -29,18 +42,10 @@ def _read_watermark(path: Path) -> int:
         return 0
 
 
-def _inbox_path(inbox: Path, session_id: str) -> Path:
-    p = inbox / f"{session_id}.jsonl"
-    n = 0
-    while p.exists():
-        n += 1
-        p = inbox / f"{session_id}.{n}.jsonl"
-    return p
-
-
 def capture_session(transcript: Path, session_id: str, cwd: str, judge, store: Store,
-                    th: Thresholds = Thresholds()) -> int:
+                    th: Thresholds | None = None) -> int:
     """Write candidate facts for new windows of a session; returns candidates written."""
+    th = th or Thresholds()
     if os.environ.get("LEARNED_EXTRACTOR"):
         return 0
     if cwd and (Path(cwd) / ".no-learn").exists():
@@ -64,8 +69,11 @@ def capture_session(transcript: Path, session_id: str, cwd: str, judge, store: S
         if judge_ok:
             try:
                 v = judge.classify_window(text, context)
-            except Exception:
-                judge_ok = False  # API down: store the rest unclassified, no further calls
+            except Exception as e:
+                # API down / no key: store the rest unclassified, no further calls
+                judge_ok = False
+                log_error(store.home, f"judge failed for session {session_id}; "
+                          "storing unclassified", e)
             else:
                 if v.kind == "none" or v.kind_prob < th.window_min_prob \
                         or v.sensitive_prob >= th.sensitive_drop:
@@ -77,22 +85,25 @@ def capture_session(transcript: Path, session_id: str, cwd: str, judge, store: S
     meta = store.home / "projects" / project / "meta.json"
     if not meta.exists():
         meta.parent.mkdir(parents=True, exist_ok=True)
-        _atomic_write(meta, json.dumps({"cwd": cwd}, ensure_ascii=False) + "\n")
+        atomic_write_text(meta, json.dumps({"cwd": cwd}, ensure_ascii=False) + "\n")
     if candidates:
-        body = "".join(c.to_json() + "\n" for c in candidates)
-        _atomic_write(_inbox_path(inbox, session_id), body)
+        create_numbered(inbox, session_id, ".jsonl",
+                        "".join(c.to_json() + "\n" for c in candidates))
     done.parent.mkdir(parents=True, exist_ok=True)
-    _atomic_write(done, json.dumps({"last_line": max(w.line_no for w in new)}))
+    atomic_write_text(done, json.dumps({"last_line": max(w.line_no for w in new)}))
     return len(candidates)
 
 
 def main(argv: list[str]) -> int:
+    home = None
     try:
+        home = learned_home()
         transcript, session_id, cwd = argv[0], argv[1], argv[2]
         from .judge import JevJudge  # lazy: typesafe_sdk loads only inside JevJudge
-        capture_session(Path(transcript), session_id, cwd, JevJudge(), Store(learned_home()))
-    except Exception:
-        pass
+        capture_session(Path(transcript), session_id, cwd, JevJudge(), Store(home))
+    except Exception as e:
+        if home is not None:
+            log_error(home, f"capture failed argv={argv!r}", e)
     return 0
 
 
