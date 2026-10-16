@@ -12,3 +12,5 @@ python -P -m learned.cli $ARGUMENTS
 ```
 
 If no arguments were given, run `python -P -m learned.cli list`.
+
+`forget <id>` stops a record from surfacing and from being relearned, but it does not erase the original record from the store's git history.

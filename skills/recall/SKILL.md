@@ -39,4 +39,4 @@ If the index does not exist (the result says so, or the call errors), fall back 
 
 ## Corrections
 
-If the user says a recalled fact is wrong or should be forgotten, point them to `/learned forget <id>` (ids are the record file names).
+If the user says a recalled fact is wrong or should be forgotten, point them to `/learned forget <id>` (ids are the record file names). Forgetting stops a record from surfacing and from being relearned, but does not erase it from the store's git history.

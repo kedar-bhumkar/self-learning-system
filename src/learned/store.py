@@ -8,7 +8,8 @@ from pathlib import Path
 from .fsutil import atomic_write_text
 from .records import Record, parse_record, render_record
 
-_IGNORE_LINES = [".lock", "inbox/", "*.tmp", "capture.log", "consolidate.log"]
+_IGNORE_LINES = [".lock", "inbox/", "*.tmp", "capture.log", "consolidate.log",
+                 "tombstones.json"]
 _SCOPE_DIRS = {"global": "global", "topic": "topics"}
 
 
@@ -137,11 +138,13 @@ class Store:
              "-c", "core.autocrlf=false", "-C", str(self.home), *args],
             capture_output=True, text=True, encoding="utf-8", errors="replace")
 
-    def _untrack_inbox(self) -> None:
-        """Stores created before inbox/ was ignored may have it tracked: untrack it once."""
-        tracked = self._git("ls-files", "--", "inbox")
-        if tracked.returncode == 0 and tracked.stdout.strip():
-            self._git("rm", "-r", "--cached", "-q", "--ignore-unmatch", "--", "inbox")
+    def _untrack_ignored(self) -> None:
+        """Stores created before inbox/ and tombstones.json were ignored may track them:
+        untrack each once (forgotten text must never reach the store's git history)."""
+        for path in ("inbox", "tombstones.json"):
+            tracked = self._git("ls-files", "--", path)
+            if tracked.returncode == 0 and tracked.stdout.strip():
+                self._git("rm", "-r", "--cached", "-q", "--ignore-unmatch", "--", path)
 
     def commit(self, message: str) -> bool:
         """Commit everything in the store repo (not a code repo).
@@ -149,7 +152,7 @@ class Store:
         Returns True if a commit was made, False if there was nothing to commit.
         Raises RuntimeError (or OSError if git is missing) when git itself fails.
         """
-        self._untrack_inbox()
+        self._untrack_ignored()
         add = self._git("add", "-A")
         if add.returncode != 0:
             raise RuntimeError(f"git add failed: {add.stderr.strip()}")

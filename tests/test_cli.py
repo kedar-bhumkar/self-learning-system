@@ -178,3 +178,14 @@ def test_rerun_reports_errors_nonzero(store, capsys, monkeypatch):
     monkeypatch.setattr(consolidate, "run", lambda *a, **k: rep)
     assert cli.main(["rerun", "--full"], store=store, factory=lambda: (None, None, None)) == 1
     assert "tagging: boom" in capsys.readouterr().err
+
+
+def test_forget_keeps_tombstones_out_of_git_and_says_history_remains(store, capsys):
+    r = rec("never use jquery")
+    store.save(r)
+    store.commit("add")
+    assert cli.main(["forget", r.id], store=store) == 0
+    assert "git history" in capsys.readouterr().out
+    assert store._git("ls-files", "tombstones.json").stdout.strip() == ""
+    assert (store.home / "tombstones.json").exists()
+    assert store.tombstones() == ["never use jquery"]

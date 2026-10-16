@@ -63,7 +63,7 @@ def _forget(store: Store, a) -> int:
         store.commit(f"forget {r.id}")
     except (RuntimeError, OSError) as e:
         print(f"forgotten, but commit failed: {e}", file=sys.stderr)
-    print(f"forgot {r.id}")
+    print(f"forgot {r.id} (it will no longer surface or be relearned; git history of the original record is not erased)")
     return 0
 
 

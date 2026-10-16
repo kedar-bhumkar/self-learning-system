@@ -229,3 +229,16 @@ def test_commit_untracks_previously_tracked_inbox_and_ignores_inbox(tmp_path):
     assert s._git("ls-files", "inbox").stdout.strip() == ""
     assert (inbox / "a.jsonl").exists()  # files stay on disk
     assert s.commit("again") is False
+
+
+def test_commit_untracks_previously_tracked_tombstones_and_keeps_file(tmp_path):
+    s = Store(tmp_path / "s")
+    s.init()
+    s.add_tombstone("secret thing")
+    s._git("add", "-f", "tombstones.json")  # simulate an older store that tracked it
+    s._git("commit", "-q", "-m", "old")
+    assert s._git("ls-files", "tombstones.json").stdout.strip()
+    s.add_tombstone("another")
+    s.commit("x")
+    assert s._git("ls-files", "tombstones.json").stdout.strip() == ""
+    assert s.tombstones() == ["secret thing", "another"]
