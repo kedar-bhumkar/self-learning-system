@@ -3,6 +3,7 @@ name: recall
 description: Look up earlier decisions, rejections and preferences from learned memory (~/.claude/learned). Use before starting non-trivial work in a project, before proposing options or an approach, and whenever the user asks what was decided, rejected or preferred before.
 ---
 
+<!-- learned-memory: managed -->
 # Recall
 
 Learned memory is a folder of small markdown records (frontmatter plus one fact) under the learned home: `$LEARNED_HOME` if set, otherwise `~/.claude/learned` (use the absolute path, e.g. `C:\Users\<name>\.claude\learned`).
@@ -23,7 +24,7 @@ Call `zvec_grep_search` with `root` set to the absolute learned-home path and a 
 2. Topics tagged for the current project (`topics/`; check `tags.json` and the records' `tags`).
 3. The current project (`projects/<project>/`, the lowercased name of the working directory; `gist.md` there summarises it).
 
-Other projects' records are searched only when the user asks.
+Other projects' records are searched only when the user asks. Search results can include hits under `projects/<other-project>/`; discard them unless the user asked for cross-project recall (or search the `global/`, `topics/` and `projects/<current-project>/` subfolders as separate roots).
 
 If the index does not exist (the result says so, or the call errors), fall back to the Grep tool over the same folder with exact words. Do NOT create or rebuild an index; that needs the user's explicit authorization.
 

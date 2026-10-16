@@ -26,9 +26,15 @@ if (-not $Python) { $Python = (Get-Command python -ErrorAction Stop).Source }
 $Python = (& $Python -c 'import sys; print(sys.executable)').Trim()
 if ($LASTEXITCODE -ne 0 -or -not $Python) { throw 'could not resolve the Python interpreter' }
 
+function Test-Managed {
+    param([string]$Path)
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
+    return [bool](Select-String -LiteralPath $Path -SimpleMatch 'learned-memory: managed' -Quiet)
+}
+
 function Invoke-Util {
     param([string[]]$UtilArgs)
-    & $Python -m learned.install_util @UtilArgs
+    & $Python -P -m learned.install_util @UtilArgs
     if ($LASTEXITCODE -ne 0) { throw "install_util failed: $($UtilArgs -join ' ')" }
 }
 
@@ -46,10 +52,15 @@ if ($DryRun) { Invoke-Util @('rule', 'remove', '--claude-md', $ClaudeMd) }
 else { Invoke-Util @('rule', 'remove', '--claude-md', $ClaudeMd, '--write') }
 
 # 4. skill + command
-Write-Output "[4/6] skill and command: remove $SkillDst and $CmdDst"
-if (-not $DryRun) {
-    if (Test-Path $SkillDst) { Remove-Item -Recurse -Force $SkillDst }
-    if (Test-Path $CmdDst) { Remove-Item -Force $CmdDst }
+Write-Output "[4/6] skill and command: remove $SkillDst and $CmdDst (only if managed by learned-memory)"
+$skillOurs = Test-Managed (Join-Path $SkillDst 'SKILL.md')
+$cmdOurs = Test-Managed $CmdDst
+foreach ($item in @(@($SkillDst, $skillOurs), @($CmdDst, $cmdOurs))) {
+    $path = $item[0]
+    if (-not (Test-Path -LiteralPath $path)) { Write-Output "      absent, nothing to remove: $path" }
+    elseif (-not $item[1]) { Write-Output "      SKIP (not managed by learned-memory, left in place): $path" }
+    elseif ($DryRun) { Write-Output "      would remove: $path" }
+    else { Remove-Item -Recurse -Force -LiteralPath $path; Write-Output "      removed: $path" }
 }
 
 # 3. scheduled task

@@ -30,9 +30,16 @@ if (-not $Python) { $Python = (Get-Command python -ErrorAction Stop).Source }
 $Python = (& $Python -c 'import sys; print(sys.executable)').Trim()
 if ($LASTEXITCODE -ne 0 -or -not $Python) { throw 'could not resolve the Python interpreter' }
 
+function Test-Managed {
+    # True when the file carries our ownership marker.
+    param([string]$Path)
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
+    return [bool](Select-String -LiteralPath $Path -SimpleMatch 'learned-memory: managed' -Quiet)
+}
+
 function Invoke-Util {
     param([string[]]$UtilArgs)
-    & $Python -m learned.install_util @UtilArgs
+    & $Python -P -m learned.install_util @UtilArgs
     if ($LASTEXITCODE -ne 0) { throw "install_util failed: $($UtilArgs -join ' ')" }
 }
 
@@ -42,6 +49,20 @@ Write-Output "python: $Python"
 Write-Output "repo:   $Repo"
 Write-Output "home:   $UserHome"
 Write-Output ''
+
+# preflight: never overwrite a skill or command the user wrote themselves
+$refused = @()
+if ((Test-Path -LiteralPath $SkillDst) -and -not (Test-Managed (Join-Path $SkillDst 'SKILL.md'))) {
+    $refused += "REFUSED: $SkillDst exists and is not managed by learned-memory (no 'learned-memory: managed' marker in SKILL.md)"
+}
+if ((Test-Path -LiteralPath $CmdDst) -and -not (Test-Managed $CmdDst)) {
+    $refused += "REFUSED: $CmdDst exists and is not managed by learned-memory (no 'learned-memory: managed' marker)"
+}
+if ($refused.Count -gt 0) {
+    $refused | ForEach-Object { Write-Output $_ }
+    Write-Output 'Nothing was changed. Move or rename the existing item(s), then run again.'
+    exit 1
+}
 
 # 1. package
 Write-Output "[1/6] pip install -e: $Python -m pip install -e `"$Repo`""
@@ -61,13 +82,13 @@ if ($DryRun) {
 
 # 3. scheduled task
 $taskCmd = "Register-ScheduledTask -TaskName $TaskName -Force " +
-    "-Action (New-ScheduledTaskAction -Execute `"$Python`" -Argument `"-m learned.consolidate`") " +
+    "-Action (New-ScheduledTaskAction -Execute `"$Python`" -Argument `"-P -m learned.consolidate`") " +
     "-Trigger (New-ScheduledTaskTrigger -Daily -At 03:00) " +
     "-Settings (New-ScheduledTaskSettingsSet -StartWhenAvailable)"
-Write-Output "[3/6] scheduled task $TaskName, daily 03:00, StartWhenAvailable, running: `"$Python`" -m learned.consolidate"
+Write-Output "[3/6] scheduled task $TaskName, daily 03:00, StartWhenAvailable, running: `"$Python`" -P -m learned.consolidate"
 Write-Output "      $taskCmd"
 if (-not $DryRun) {
-    $action = New-ScheduledTaskAction -Execute $Python -Argument '-m learned.consolidate'
+    $action = New-ScheduledTaskAction -Execute $Python -Argument '-P -m learned.consolidate'
     $trigger = New-ScheduledTaskTrigger -Daily -At 03:00
     $tset = New-ScheduledTaskSettingsSet -StartWhenAvailable
     Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Settings $tset -Force | Out-Null

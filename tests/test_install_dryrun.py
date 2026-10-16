@@ -34,23 +34,56 @@ def test_settings_merge_preserves_existing_hooks():
     ends = out["hooks"]["SessionEnd"]
     assert ends[0] == EXISTING["hooks"]["SessionEnd"][0]
     assert ends[1] == {"hooks": [{"type": "command", "command": PY,
-                                  "args": ["-m", "learned.hooks.session_end"], "timeout": 5}]}
+                                  "args": ["-P", "-m", "learned.hooks.session_end"], "timeout": 5}]}
     assert out["hooks"]["SessionStart"] == [
         {"matcher": "startup|resume|clear",
          "hooks": [{"type": "command", "command": PY,
-                    "args": ["-m", "learned.hooks.session_start"], "timeout": 5}]}]
+                    "args": ["-P", "-m", "learned.hooks.session_start"], "timeout": 5}]}]
     assert "learned" not in json.dumps(EXISTING)  # input not mutated
 
 
-def test_merge_is_idempotent_and_handles_empty():
-    once = merged(EXISTING)
-    assert merged(once) == once
-    assert merged({})["hooks"]["SessionEnd"] == [session_end_group(PY)]
+def test_merge_over_old_bare_m_entry_updates_in_place():
+    old = {"hooks": {
+        "SessionEnd": [{"hooks": [{"type": "command", "command": "old.exe",
+                                   "args": ["-m", "learned.hooks.session_end"], "timeout": 5}]}],
+        "SessionStart": [{"matcher": "startup|resume|clear", "hooks": [
+            {"type": "command", "command": "old.exe",
+             "args": ["-m", "learned.hooks.session_start"], "timeout": 5}]}]}}
+    out = merged(old)
+    assert len(out["hooks"]["SessionEnd"]) == 1 and len(out["hooks"]["SessionStart"]) == 1
+    h = out["hooks"]["SessionEnd"][0]["hooks"]
+    assert len(h) == 1 and h[0]["args"] == ["-P", "-m", "learned.hooks.session_end"]
+    assert h[0]["command"] == PY
+    assert unmerge_hooks(old) == {}  # old form is removed too
 
 
-def test_unmerge_removes_only_ours():
-    assert unmerge_hooks(merged(EXISTING)) == EXISTING
-    assert unmerge_hooks(merged({})) == {}
+def test_unmerge_keeps_user_empty_containers():
+    s = {"hooks": {"SessionStart": [], "Other": []}}
+    assert unmerge_hooks(s) == s
+    assert unmerge_hooks({"hooks": {}}) == {"hooks": {}}
+
+
+@pytest.mark.parametrize("bad", [{"hooks": []}, {"hooks": {"SessionEnd": {}}},
+                                 {"hooks": {"SessionStart": ["x"]}},
+                                 {"hooks": {"SessionEnd": [{"hooks": "x"}]}}])
+def test_bad_shapes_raise(bad):
+    with pytest.raises(ValueError):
+        merged(bad)
+    with pytest.raises(ValueError):
+        unmerge_hooks(bad)
+
+
+def test_rule_block_unbalanced_markers_error_and_outdated_body_refreshed():
+    from learned.install_util import END, START
+    for bad in (START + "\nx\n", "x\n" + END + "\n", END + "\n" + START + "\n"):
+        with pytest.raises(ValueError):
+            add_rule_block(bad)
+        with pytest.raises(ValueError):
+            remove_rule_block(bad)
+    old = f"top\n\n{START}\nold text\n{END}\nbottom\n"
+    new = add_rule_block(old)
+    assert "old text" not in new and new.count(START) == 1
+    assert new.startswith("top\n\n") and new.endswith("\nbottom\n")
 
 
 def test_rule_block_idempotent_removable_and_keeps_line_endings():
@@ -98,7 +131,7 @@ def test_install_dryrun_lists_all_six_changes_and_modifies_nothing(tmp_path):
                    "[4/6] skill and command", "[5/6] CLAUDE.md", "[6/6] Store.init"):
         assert marker in out, marker
     assert "learned.hooks.session_end" in out and "learned.hooks.session_start" in out
-    assert "learned.consolidate" in out and "03:00" in out and "StartWhenAvailable" in out
+    assert "-P -m learned.consolidate" in out and "03:00" in out and "StartWhenAvailable" in out
     assert str(home) in out
     assert _tree(home) == before
 
@@ -112,5 +145,93 @@ def test_uninstall_dryrun_modifies_nothing(tmp_path):
     before = _tree(home)
     res = _run("uninstall.ps1", home, "-DryRun")
     assert res.returncode == 0, res.stderr + res.stdout
-    assert "learned.hooks.session_end" in res.stdout or "remove" in res.stdout.lower()
+    assert "would remove learned hooks" in res.stdout
     assert _tree(home) == before
+
+
+# ---- --write paths (python level, temp files only) ----
+def _util(*args):
+    return subprocess.run([PY, "-P", "-m", "learned.install_util", *args], capture_output=True,
+                          text=True, encoding="utf-8", errors="replace")
+
+
+@pytest.mark.parametrize("nl", ["\n", "\r\n"])
+def test_write_preserves_line_endings_and_backs_up(tmp_path, nl):
+    f = tmp_path / "settings.json"
+    raw = json.dumps(EXISTING, indent=2).replace("\n", nl) + nl
+    f.write_bytes(raw.encode("utf-8"))
+    res = _util("merge-hooks", "--settings", str(f), "--python", PY, "--write")
+    assert res.returncode == 0, res.stderr
+    out = f.read_bytes().decode("utf-8")
+    assert out.endswith(nl)
+    assert out.count("\r\n") == (out.count("\n") if nl == "\r\n" else 0)
+    assert json.loads(out)["hooks"]["SessionEnd"][1]["hooks"][0]["args"][0] == "-P"
+    baks = list(tmp_path.glob("settings.json.bak-*"))
+    assert len(baks) == 1 and baks[0].read_bytes() == raw.encode("utf-8")
+    res = _util("unmerge-hooks", "--settings", str(f), "--write")
+    assert res.returncode == 0
+    assert json.loads(f.read_text(encoding="utf-8")) == EXISTING
+
+
+def test_write_without_trailing_newline_keeps_none(tmp_path):
+    f = tmp_path / "settings.json"
+    f.write_bytes(json.dumps({"a": 1}).encode("utf-8"))
+    assert _util("merge-hooks", "--settings", str(f), "--python", PY, "--write").returncode == 0
+    assert not f.read_bytes().endswith(b"\n")
+
+
+def test_malformed_settings_exits_nonzero_and_is_untouched(tmp_path):
+    f = tmp_path / "settings.json"
+    f.write_bytes(b'{"hooks": ')
+    for cmd in (("merge-hooks", "--python", PY), ("unmerge-hooks",)):
+        res = _util(cmd[0], "--settings", str(f), *cmd[1:], "--write")
+        assert res.returncode != 0 and "not valid JSON" in res.stderr
+    assert f.read_bytes() == b'{"hooks": ' and not list(tmp_path.glob("*.bak-*"))
+
+
+def test_claude_md_unbalanced_marker_exits_nonzero(tmp_path):
+    f = tmp_path / "CLAUDE.md"
+    f.write_bytes(b"x\n<!-- learned-memory:start -->\n")
+    res = _util("rule", "add", "--claude-md", str(f), "--write")
+    assert res.returncode != 0 and f.read_bytes() == b"x\n<!-- learned-memory:start -->\n"
+
+
+# ---- ownership of skill / command ----
+@pytest.mark.skipif(POWERSHELL is None, reason="PowerShell not available")
+def test_install_refuses_foreign_skill_and_command(tmp_path):
+    home = tmp_path / "home"
+    skill = home / ".claude" / "skills" / "recall"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text("my own recall skill", encoding="utf-8")
+    before = _tree(home)
+    res = _run("install.ps1", home, "-DryRun")
+    assert res.returncode != 0 and "REFUSED" in res.stdout and "skills" in res.stdout
+    assert _tree(home) == before
+    (skill / "SKILL.md").write_text("<!-- learned-memory: managed -->\n", encoding="utf-8")
+    cmd = home / ".claude" / "commands" / "learned.md"
+    cmd.parent.mkdir(parents=True)
+    cmd.write_text("mine", encoding="utf-8")
+    res = _run("install.ps1", home, "-DryRun")
+    assert res.returncode != 0 and "REFUSED" in res.stdout and "learned.md" in res.stdout
+    cmd.write_text("<!-- learned-memory: managed -->\n", encoding="utf-8")
+    res = _run("install.ps1", home, "-DryRun")
+    assert res.returncode == 0 and "REFUSED" not in res.stdout
+
+
+@pytest.mark.skipif(POWERSHELL is None, reason="PowerShell not available")
+def test_uninstall_skips_foreign_and_removes_managed(tmp_path):
+    home = tmp_path / "home"
+    skill = home / ".claude" / "skills" / "recall"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text("my own recall skill", encoding="utf-8")
+    res = _run("uninstall.ps1", home, "-DryRun")
+    assert res.returncode == 0 and "SKIP (not managed" in res.stdout
+    (skill / "SKILL.md").write_text("<!-- learned-memory: managed -->", encoding="utf-8")
+    res = _run("uninstall.ps1", home, "-DryRun")
+    assert "would remove: " + str(skill) in res.stdout
+
+
+def test_shipped_files_carry_ownership_marker():
+    for rel in ("skills/recall/SKILL.md", "commands/learned.md"):
+        assert "learned-memory: managed" in (ROOT / rel).read_text(encoding="utf-8")
+    assert "python -P -m learned.cli" in (ROOT / "commands/learned.md").read_text(encoding="utf-8")
