@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import time
 import uuid
 from pathlib import Path
 
@@ -16,7 +17,15 @@ def atomic_write_text(path: Path, text: str) -> None:
     tmp = _tmp_for(path)
     try:
         tmp.write_text(text, encoding="utf-8", newline="\n")
-        os.replace(tmp, path)
+        for attempt in range(3):
+            try:
+                os.replace(tmp, path)
+                break
+            except PermissionError:
+                # Windows: a reader holding the target open; retry briefly (~100 ms total)
+                if attempt == 2:
+                    raise
+                time.sleep(0.05)
     finally:
         if tmp.exists():
             try:

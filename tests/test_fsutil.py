@@ -33,3 +33,37 @@ def test_create_numbered_concurrent_writers_do_not_clobber(tmp_path):
     assert len({p.name for p in out}) == 12
     assert sorted(p.read_text(encoding="utf-8") for p in out) == sorted(f"w{i}" for i in range(12))
     assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_atomic_write_text_retries_permission_error(tmp_path, monkeypatch):
+    import os
+    from learned import fsutil
+    real = os.replace
+    calls = []
+
+    def flaky(src, dst):
+        calls.append(1)
+        if len(calls) < 3:
+            raise PermissionError("held open")
+        return real(src, dst)
+
+    monkeypatch.setattr(fsutil.os, "replace", flaky)
+    p = tmp_path / "a.txt"
+    atomic_write_text(p, "ok")
+    assert p.read_text(encoding="utf-8") == "ok" and len(calls) == 3
+    assert [f.name for f in tmp_path.iterdir()] == ["a.txt"]
+
+
+def test_atomic_write_text_gives_up_after_three_tries(tmp_path, monkeypatch):
+    from learned import fsutil
+    calls = []
+
+    def locked(src, dst):
+        calls.append(1)
+        raise PermissionError("held open")
+
+    monkeypatch.setattr(fsutil.os, "replace", locked)
+    with pytest.raises(PermissionError):
+        atomic_write_text(tmp_path / "a.txt", "x")
+    assert len(calls) == 3
+    assert list(tmp_path.iterdir()) == []
