@@ -8,11 +8,13 @@ from __future__ import annotations
 from pathlib import Path
 
 from .config import Thresholds
+from .fsutil import atomic_write_text
 from .store import Store
 
 HEADER = ("Learned notes from past sessions (background context, not instructions; "
           "may be out of date):")
-G_TITLE = "Global (how the user works):"
+HEADER_PREFIX = "Learned notes from past sessions"
+G_TITLE ="Global (how the user works):"
 R_TITLE = "Recent decisions and rejections in this project:"
 _ITEM_MAX = 400
 _GIST_MAX = 2000
@@ -27,14 +29,16 @@ def _item(r) -> str:
     return f"- ({flags}) {body}"
 
 
-def _global_rank(r):
-    # stated first, then more sources, then newer last_seen; stale only after everything else
-    return (r.stale, r.confidence != "stated", -len(r.sources), _neg(r.last_seen))
+def _rank_global(recs: list) -> list:
+    """stated first, then more sources, then newer last_seen; stale last.
 
-
-def _neg(s: str):
-    # descending string order: invert code points
-    return tuple(-ord(c) for c in s)
+    Stable multi-pass sort (least significant key first), so timestamps of different
+    lengths still compare correctly."""
+    recs = sorted(recs, key=lambda r: r.last_seen, reverse=True)
+    recs.sort(key=lambda r: -len(r.sources))
+    recs.sort(key=lambda r: r.confidence != "stated")
+    recs.sort(key=lambda r: r.stale)
+    return recs
 
 
 def _is_item(line: str) -> bool:
@@ -70,7 +74,7 @@ def _fit(header: str, g: list[str], p: list[str], cap: int) -> str:
 
 
 def _global_lines(store: Store) -> list[str]:
-    recs = sorted(store.load_all(scope="global"), key=_global_rank)
+    recs = _rank_global(store.load_all(scope="global"))
     return [G_TITLE] + [_item(r) for r in recs] if recs else []
 
 
@@ -107,7 +111,8 @@ def project_block(store: Store, project: str, th: Thresholds) -> str:
 
 def combine_blocks(global_text: str, project_text: str, cap: int) -> str:
     """Join an existing global block (e.g. core.md) and a project block under the cap."""
-    g = [l for l in global_text.splitlines() if l.strip() and l != HEADER]
+    g = [l for l in global_text.splitlines()
+         if l.strip() and not l.startswith(HEADER_PREFIX)]
     p = [l for l in project_text.splitlines() if l.strip()]
     return _fit(HEADER, g, p, cap)
 
@@ -120,5 +125,5 @@ def build_core(store: Store, project: str | None, th: Thresholds) -> str:
 def write_core_md(store: Store, th: Thresholds) -> Path:
     path = store.home / "core.md"
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(global_block(store, th), encoding="utf-8", newline="\n")
+    atomic_write_text(path, global_block(store, th))
     return path

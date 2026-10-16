@@ -117,3 +117,32 @@ def test_write_core_md(tmp_path):
 def test_multiline_body_collapsed_to_one_line(tmp_path):
     s = mkstore(tmp_path, rec("line one\nline two"))
     assert "- " in global_block(s, TH) and "line one line two" in global_block(s, TH)
+
+
+def test_combine_blocks_does_not_duplicate_header(tmp_path):
+    from learned.core import combine_blocks
+    s = mkstore(tmp_path, rec("Prefers uv"), rec("Rejected Z", scope="project", kind="rejection"))
+    core_md = global_block(s, TH)
+    out = combine_blocks(core_md, project_block(s, "proj", TH), TH.core_max_chars)
+    assert out.count("Learned notes from past sessions") == 1
+    assert out == build_core(s, "proj", TH)
+    # an older/different header wording in core.md is dropped too
+    old = "Learned notes from past sessions (old wording)\nGlobal (how the user works):\n- (preference, stated) x"
+    out2 = combine_blocks(old, "", TH.core_max_chars)
+    assert out2.count("Learned notes from past sessions") == 1 and "old wording" not in out2
+
+
+def test_ranking_handles_timestamps_of_different_lengths(tmp_path):
+    s = mkstore(tmp_path,
+                rec("DATE only", last_seen="2026-01-01"),
+                rec("DATETIME later", last_seen="2026-01-01T10:00:00Z"),
+                rec("EARLIER", last_seen="2025-12-31T23:59:59Z"))
+    out = global_block(s, TH)
+    assert out.index("DATETIME later") < out.index("DATE only") < out.index("EARLIER")
+
+
+def test_stale_stated_ranks_after_fresh_inferred(tmp_path):
+    s = mkstore(tmp_path, rec("STALE stated", stale=True),
+                rec("FRESH inferred", confidence="inferred"))
+    out = global_block(s, TH)
+    assert out.index("FRESH inferred") < out.index("STALE stated")

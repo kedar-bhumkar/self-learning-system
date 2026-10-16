@@ -91,3 +91,17 @@ def test_module_entry_exits_zero_on_garbage(tmp_path):
                        capture_output=True, env={**__import__("os").environ,
                                                  "LEARNED_HOME": str(tmp_path / "none")})
     assert r.returncode == 0 and r.stdout == b""
+
+
+def test_hook_outer_except_returns_empty_when_core_raises(tmp_path, monkeypatch):
+    s = Store(tmp_path)
+    s.init()
+    s.save(rec("Good one"))
+    import learned.core as core
+
+    def boom(*a, **k):
+        raise RuntimeError("core exploded")
+
+    monkeypatch.setattr(core, "global_block", boom)
+    monkeypatch.setattr(core, "combine_blocks", boom)
+    assert main(payload(), home=tmp_path) == ""
