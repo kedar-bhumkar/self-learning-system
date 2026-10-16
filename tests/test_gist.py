@@ -125,3 +125,39 @@ def test_claude_p_nonzero_exit_raises(monkeypatch):
         a, 2, stdout="", stderr="boom"))
     with pytest.raises(RuntimeError, match="boom"):
         gist.claude_p("x")
+
+
+FENCE = "```"
+FENCED = f"""{FENCE}markdown
+{GIST}{FENCE}"""
+
+
+@pytest.mark.parametrize("reply", [
+    "I cannot help with that.",
+    "Sure! Here is the gist you asked for.",
+    "## Purpose\nOnly one heading.",
+    "## Purpose\nA\n\n## Architecture\nB\n",
+])
+def test_invalid_runner_output_keeps_previous_gist_and_logs(store, tmp_path, reply):
+    setup_project(store, tmp_path)
+    add_record(store, "a fact")
+    p = store.home / "projects" / "alpha" / "gist.md"
+    p.write_text("old gist\n", encoding="utf-8")
+    assert gist.refresh_gists(store, Runner(reply), {"alpha"}) == []
+    assert p.read_text(encoding="utf-8") == "old gist\n"
+    assert "alpha" in (store.home / "consolidate.log").read_text(encoding="utf-8")
+
+
+def test_code_fenced_reply_is_unwrapped(store, tmp_path):
+    setup_project(store, tmp_path)
+    add_record(store, "a fact")
+    assert gist.refresh_gists(store, Runner(FENCED), {"alpha"}) == ["alpha"]
+    assert (store.home / "projects" / "alpha" / "gist.md").read_text(encoding="utf-8") == GIST
+
+
+def test_claude_p_uses_strict_mcp_config(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(gist.subprocess, "run", lambda a, **kw: seen.update(args=a) or
+                        subprocess.CompletedProcess(a, 0, stdout="x", stderr=""))
+    gist.claude_p("p")
+    assert "--strict-mcp-config" in seen["args"]

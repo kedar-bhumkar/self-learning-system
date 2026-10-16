@@ -3,12 +3,14 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
 from pathlib import Path
 
 from .fsutil import atomic_write_text
+from .logutil import log_line
 from .records import Record
 from .store import Store
 
@@ -27,13 +29,29 @@ def claude_p(prompt: str, timeout: int = 120) -> str:
     with tempfile.TemporaryDirectory(prefix="learned-claude-") as cwd:
         res = subprocess.run(
             [exe, "-p", "--model", "haiku", "--output-format", "text",
-             "--no-session-persistence"],
+             "--no-session-persistence", "--strict-mcp-config"],
             input=prompt, capture_output=True, encoding="utf-8", errors="replace",
             timeout=timeout, env=env, cwd=cwd)
     if res.returncode != 0:
         raise RuntimeError(f"claude -p failed ({res.returncode}): "
                            f"{(res.stderr or res.stdout).strip()[:500]}")
     return res.stdout.strip()
+
+
+_HEADINGS = ("Purpose", "Architecture", "Status")
+_FENCE = re.compile(r"^\s*```[^\n]*\n(.*?)\n?```\s*$", re.S)
+
+
+def _valid_gist(out: str) -> str | None:
+    """Strip one surrounding code fence; return the text only if all three headings exist."""
+    out = (out or "").replace("\r\n", "\n").strip()
+    m = _FENCE.match(out)
+    if m:
+        out = m.group(1).strip()
+    for h in _HEADINGS:
+        if not re.search(rf"^##[ \t]+{h}[ \t]*$", out, re.M):
+            return None
+    return out
 
 
 def _read_doc(directory: Path, name: str) -> str:
@@ -93,8 +111,11 @@ def refresh_gists(store: Store, runner, projects: set[str],
             out = runner(_prompt(project, readme, claude_md, previous, recs))
         except Exception:
             continue
-        out = (out or "").strip()
-        if not out:
+        out = _valid_gist(out)
+        if out is None:
+            log_line(store.home, "consolidate.log",
+                     f"gist for {project} rejected: runner output lacks "
+                     "'## Purpose' / '## Architecture' / '## Status'; kept previous gist")
             continue
         atomic_write_text(gist_path, out[:_GIST_MAX] + "\n")
         done.append(project)
