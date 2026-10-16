@@ -10,6 +10,7 @@ from .models import Window
 CONTEXT_MAX = 1500
 _SKIP_PREFIXES = ("<system-reminder>", "<local-command", "<command-name>")
 _PASTED = re.compile(r"<pasted_content\b[^>]*>.*?</pasted_content>", re.DOTALL)
+_REMINDER = re.compile(r"<system-reminder>.*?(?:</system-reminder>|\Z)", re.DOTALL)
 
 
 def _blocks(content) -> list:
@@ -21,8 +22,16 @@ def _blocks(content) -> list:
 
 
 def _text_of(blocks: list) -> str:
-    parts = [b.get("text", "") for b in blocks
-             if b.get("type") == "text" and isinstance(b.get("text"), str)]
+    parts = []
+    for b in blocks:
+        t = b.get("text")
+        if b.get("type") != "text" or not isinstance(t, str):
+            continue
+        if t.lstrip().startswith(_SKIP_PREFIXES):
+            continue
+        t = _REMINDER.sub("", t).strip()
+        if t:
+            parts.append(t)
     return "\n".join(parts)
 
 

@@ -104,3 +104,19 @@ def test_pasted_content_tags_removed(tmp_path):
     assert len(ws) == 1
     assert "SECRET" not in ws[0].text
     assert ws[0].text.split() == ["before", "after"]
+
+
+def test_system_reminder_blocks_and_spans_removed(tmp_path):
+    p = write(tmp_path, [
+        line("user", [{"type": "text", "text": "real one"},
+                      {"type": "text", "text": "<system-reminder>noise</system-reminder>"}]),
+        line("user", [{"type": "text", "text": "<system-reminder>noise</system-reminder>"},
+                      {"type": "text", "text": "real two"}]),
+        line("user", [{"type": "text", "text": "<system-reminder>only</system-reminder>"}]),
+        line("user", "real three <system-reminder>\nmulti\nline</system-reminder> tail"),
+        line("user", [{"type": "text", "text": "<command-name>/x</command-name>"},
+                      {"type": "text", "text": "real four"}]),
+    ])
+    texts = [w.text for w in extract_windows(p)]
+    assert texts == ["real one", "real two", "real three  tail", "real four"]
+    assert all("noise" not in t and "multi" not in t for t in texts)
