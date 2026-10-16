@@ -211,3 +211,23 @@ def test_judge_failure_collects_failed_ids_and_keeps_earlier_events(store):
     assert len(ev) == 1 and failed == [c.id]
     with pytest.raises(RuntimeError):
         promote(store, FakeJudge(promotion=prom), emb, TH, [c], False, NOW)
+
+
+def test_promotion_into_existing_target_unions_tags(store):
+    a, b = pair(store)
+    a.tags, b.tags = ["uv", "python"], ["tooling"]
+    store.save(a)
+    store.save(b)
+    ev = promote(store, verdict(), EMB, TH, [a], False, NOW)
+    nid = ev[0].new_id
+    g = store.get(nid)
+    g.status, g.tags = "superseded", ["old-tag", "uv"]
+    store.save(g)
+    for r in (a, b):  # reactivate members so the same cluster promotes again
+        m = store.get(r.id)
+        m.status, m.promoted_to = "active", None
+        store.save(m)
+    ev = promote(store, verdict(), EMB, TH, [store.get(a.id)], False, NOW)
+    g = store.get(ev[0].new_id)
+    assert g.id == nid and g.status == "active"
+    assert g.tags == ["old-tag", "uv", "python", "tooling"]

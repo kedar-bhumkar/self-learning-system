@@ -61,6 +61,9 @@ def _apply(store: Store, members: list[Record], scope: str, now: str) -> str:
         for s in sources:
             if s not in existing.sources:
                 existing.sources.append(s)
+        for t in tags:
+            if t not in existing.tags:
+                existing.tags.append(t)
         existing.status, existing.last_seen = "active", now
         new = existing
     else:
