@@ -130,3 +130,21 @@ def test_commit_returns_false_when_clean(tmp_path):
     log = subprocess.run(["git", "-C", str(tmp_path), "log", "--oneline"],
                          capture_output=True, text=True).stdout
     assert "add" in log
+
+
+def test_project_name_is_always_a_safe_single_component(monkeypatch, tmp_path):
+    monkeypatch.setenv("USERPROFILE", str(tmp_path / "h"))
+    monkeypatch.setenv("HOME", str(tmp_path / "h"))
+    assert project_name("D:\\") == "root"
+    assert project_name("D:") == "root"
+    assert project_name("/") == "home"  # empty after normalisation
+    assert project_name(r"C:\a\b:c") == "b_c"
+    assert project_name(r"C:\x\con") == "con_"
+    assert project_name(r"C:\x\NUL.txt") == "nul.txt_"
+    assert project_name(r"C:\x\lpt3") == "lpt3_"
+    assert project_name(r"C:\x\..") == "root"
+    assert project_name(r"C:\x\a?b*c") == "a_b_c"
+    assert project_name(str(tmp_path / "h")) == "home"
+    for bad in ("D:\\", r"C:\a\b:c", "con", "../..", "a/../..", "x\..\.."):
+        n = project_name(bad)
+        assert n and n not in (".", "..") and not set(n) & set('/\:*?"<>|')

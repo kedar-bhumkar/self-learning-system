@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -17,8 +18,18 @@ def _norm(p: str) -> str:
     return p.replace("\\", "/").rstrip("/").lower()
 
 
+_INVALID = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+_DRIVE = re.compile(r"^[a-z]:$")
+_RESERVED = {"con", "prn", "aux", "nul",
+             *(f"com{i}" for i in range(1, 10)), *(f"lpt{i}" for i in range(1, 10))}
+
+
 def project_name(cwd: str) -> str:
-    """Lowercased basename of cwd; 'home' if cwd is the user's home directory."""
+    """Safe, lowercased directory name for cwd; 'home' for the home dir, 'root' for a drive root.
+
+    The result is always a single valid Windows path component (never '..', never contains
+    separators or ':'), so it cannot escape projects/.
+    """
     norm = _norm(cwd or "")
     homes = {_norm(str(Path.home()))}
     for var in ("USERPROFILE", "HOME"):
@@ -26,7 +37,15 @@ def project_name(cwd: str) -> str:
             homes.add(_norm(os.environ[var]))
     if not norm or norm in homes:
         return "home"
-    return norm.rsplit("/", 1)[-1] or "home"
+    base = norm.rsplit("/", 1)[-1]
+    if _DRIVE.match(base):
+        return "root"
+    base = _INVALID.sub("_", base).rstrip(". ")
+    if not base:
+        return "root"
+    if base.split(".", 1)[0].rstrip() in _RESERVED:
+        base += "_"
+    return base
 
 
 @dataclass
