@@ -147,7 +147,7 @@ def test_promoted_record_keeps_origin_and_union_of_sources(store):
     assert g.project == "beta"  # newest member's origin
     assert g.body == "prefer uv over pip"
     assert g.sources == ["s1", "s2", "s-beta"]
-    assert g.status == "active" and g.created == NOW and g.confidence == "stated"
+    assert g.status == "active" and g.created == "2026-09-01T00:00:00Z" and g.confidence == "stated"
 
 
 def test_newest_stated_member_body_wins_over_newer_inferred(store):
@@ -173,3 +173,41 @@ def test_shadow_then_live_applies_cached_verdict(store):
     ev = promote(store, j, EMB, TH, [store.get(a.id)], False, NOW)
     assert len(calls) == 1 and len(ev) == 1 and ev[0].applied
     assert len(log_lines(store)) == 2
+
+
+def test_promoted_record_created_is_earliest_member_created(store):
+    a, b = pair(store)
+    a.created = "2026-03-01T00:00:00Z"
+    store.save(a)
+    promote(store, verdict(), EMB, TH, [a], False, NOW)
+    (g,) = store.load_all(scope="global")
+    assert g.created == "2026-03-01T00:00:00Z"
+
+
+def test_unwritable_promotions_log_does_not_abort(store):
+    a, b = pair(store)
+    (store.home / "promotions.log").mkdir()  # appending to a directory raises OSError
+    ev = promote(store, verdict(), EMB, TH, [a], False, NOW)
+    assert len(ev) == 1 and store.load_all(scope="global")
+    assert "promotions.log" in (store.home / "consolidate.log").read_text(encoding="utf-8")
+
+
+def test_judge_failure_collects_failed_ids_and_keeps_earlier_events(store):
+    a, b = pair(store)
+    c = rec("lint with ruff", "alpha")
+    d = rec("ruff for linting", "beta")
+    store.save(c)
+    store.save(d)
+    emb = FakeEmbedder({"always use uv": [1, 0], "prefer uv over pip": [0.95, 0.1],
+                        "lint with ruff": [0, 1], "ruff for linting": [0.1, 0.95]})
+
+    def prom(texts):
+        if "lint with ruff" in texts:
+            raise RuntimeError("down")
+        return PromotionVerdict(0.95, 0.95, 0.95)
+
+    failed = []
+    ev = promote(store, FakeJudge(promotion=prom), emb, TH, [a, c], False, NOW, failed)
+    assert len(ev) == 1 and failed == [c.id]
+    with pytest.raises(RuntimeError):
+        promote(store, FakeJudge(promotion=prom), emb, TH, [c], False, NOW)

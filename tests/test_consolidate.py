@@ -241,7 +241,7 @@ def test_promotion_applied_after_shadow_period(home):
     rep = run(home, judge, e, Runner(), TH, NOW)
     assert [ev.applied for ev in rep.promotions] == [True]
     assert len(store.load_all(scope="global")) == 1
-    assert "(" in (home / "core.md").read_text(encoding="utf-8")
+    assert "- (preference, stated) always use uv" in (home / "core.md").read_text(encoding="utf-8")
 
 
 def test_first_run_starts_a_seven_day_shadow_period(home):
@@ -283,3 +283,120 @@ def test_capture_during_run_not_lost(home):
     assert (home / "inbox" / "s2.jsonl").exists()
     assert (home / "inbox" / "processed" / "s1.jsonl").exists()
     assert "late fact" not in [r.body for r in store.load_all()]
+
+
+def commit_subject(home):
+    return git_log(home)[0]
+
+
+def test_same_fact_from_two_projects_is_promoted_not_merged(home):
+    store = Store(home)
+    store.set_config(shadow_until="2026-01-01", shadow_applied=True)
+    put(home, "a.jsonl", [cand("always use uv", project="alpha", session="sa")])
+    put(home, "b.jsonl", [cand("prefer uv over pip", project="beta", session="sb")])
+    judge = FakeJudge(same_fact=lambda a, b: 0.95,
+                      promotion=lambda t: PromotionVerdict(0.95, 0.95, 0.95))
+    e = FakeEmbedder({"always use uv": [1, 0], "prefer uv over pip": [0.95, 0.1]})
+    rep = run(home, judge, e, Runner(), TH, NOW)
+    assert len(rep.ingest.created) == 2 and rep.ingest.merged == []
+    assert [ev.applied for ev in rep.promotions] == [True]
+    assert len(store.load_all(scope="global")) == 1
+    assert "1 promoted" in commit_subject(home) and "2 new" in commit_subject(home)
+
+
+def test_jev_outage_in_tagging_and_promotion_is_retried_next_run(home):
+    store = Store(home)
+    store.add_tag("tooling", "Tooling")
+    store.set_config(shadow_until="2026-01-01", shadow_applied=True)
+    store.save(rec("prefer uv over pip", project="beta"))
+    put(home, "s1.jsonl", [cand("always use uv", project="alpha")])
+    e = FakeEmbedder({"always use uv": [1, 0], "prefer uv over pip": [0.95, 0.1]})
+
+    def down(*a):
+        raise RuntimeError("jev down")
+
+    rep1 = run(home, FakeJudge(choose_tag=down, promotion=down), e, Runner(), TH, NOW)
+    assert rep1.jev_failed and rep1.promotions == []
+    assert store.load_all(scope="global") == []
+    cfg = store.config()
+    assert len(cfg["pending_tag"]) == 1 and len(cfg["pending_promote"]) == 1
+    assert "jev failed" in commit_subject(home)
+
+    good = FakeJudge(choose_tag=lambda t, tags: TagVerdict("tooling", {"tooling": 0.9, "none": 0.0}),
+                     promotion=lambda t: PromotionVerdict(0.95, 0.95, 0.95))
+    rep2 = run(home, good, e, Runner(), TH, "2026-10-17T03:00:00Z")
+    assert not rep2.jev_failed and rep2.tagged == 1
+    assert [ev.applied for ev in rep2.promotions] == [True]
+    cfg = store.config()
+    assert cfg["pending_tag"] == [] and cfg["pending_promote"] == []
+    assert len(store.load_all(scope="global")) == 1
+    assert store.get(new_id("always use uv", "alpha")).tags == ["tooling"]
+
+
+def test_recheck_new_tags_skips_pinned(home):
+    store = Store(home)
+    store.add_tag("new-tag", "d")
+    pin, other = rec("pinned fact", pinned=True), rec("other fact")
+    store.save(pin)
+    store.save(other)
+    seen = []
+    j = FakeJudge(fits_tag=lambda t, g, d: seen.append(t) or 0.9)
+    assert recheck_new_tags(store, j, ["new-tag"], TH) == 1
+    assert seen == ["other fact"] and store.get(pin.id).tags == []
+
+
+def test_full_with_jev_down_keeps_every_tag(home):
+    store = Store(home)
+    store.set_config(shadow_until="2026-01-01", shadow_applied=True)
+    store.add_tag("t1", "d")
+    a, b = rec("fact a", tags=["t1"]), rec("fact b", project="beta", tags=["t1"])
+    store.save(a)
+    store.save(b)
+
+    def down(*x):
+        raise RuntimeError("down")
+
+    rep = run(home, FakeJudge(choose_tag=down), FakeEmbedder({}), Runner(), TH, NOW, full=True)
+    assert rep.jev_failed
+    assert store.get(a.id).tags == ["t1"] and store.get(b.id).tags == ["t1"]
+
+
+@pytest.mark.parametrize("value", ["garbage", None, 42])
+def test_unparseable_shadow_until_fails_closed(home, value):
+    store, judge, e = two_project_setup(home)
+    store.set_config(shadow_until=value)
+    rep = run(home, judge, e, Runner(), TH, NOW)
+    assert [ev.applied for ev in rep.promotions] == [False]
+    assert store.load_all(scope="global") == []
+
+
+def test_failed_prepare_means_shadow(home, monkeypatch):
+    store, judge, e = two_project_setup(home)
+    store.set_config(shadow_until="2026-01-01")
+    monkeypatch.setattr(Store, "tags", lambda self: (_ for _ in ()).throw(OSError("disk")))
+    rep = run(home, judge, e, Runner(), TH, NOW)
+    assert all(not ev.applied for ev in rep.promotions)
+    assert store.load_all(scope="global") == []
+
+
+def test_shadow_verdicts_applied_in_one_pass_after_shadow_ends(home):
+    store, judge, e = two_project_setup(home)
+    calls = []
+    inner = judge.promotion
+    judge.promotion = lambda t: calls.append(1) or inner(t)
+    store.set_config(shadow_until="2026-10-16")
+    run(home, judge, e, Runner(), TH, NOW)  # shadow: logged, cached
+    assert len(calls) == 1 and store.load_all(scope="global") == []
+    assert "shadow_applied" not in store.config()
+    rep = run(home, judge, e, Runner(), TH, "2026-10-17T03:00:00Z")  # nothing new in inbox
+    assert [ev.applied for ev in rep.promotions] == [True]
+    assert len(calls) == 1  # cached verdict reused, no new Jev call
+    assert store.config()["shadow_applied"] is True
+
+
+def test_pending_recheck_has_no_duplicates(home):
+    store = Store(home)
+    store.set_config(pending_recheck=["x", "x"], last_sweep="2026-10-15T00:00:00Z")
+    put(home, "s1.jsonl", [cand("always use uv")])
+    run(home, FakeJudge(), emb("always use uv"), Runner(), TH, NOW)
+    assert store.config()["pending_recheck"] == ["x", "tooling"]

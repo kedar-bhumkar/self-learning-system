@@ -7,6 +7,7 @@ from dataclasses import asdict, dataclass
 import numpy as np
 
 from .config import Thresholds
+from .logutil import log_line
 from .models import PromotionVerdict
 from .records import Record, new_id
 from .store import Store
@@ -29,8 +30,11 @@ def _key(ids: list[str]) -> str:
 
 def _log(store: Store, now: str, ev: PromotionEvent) -> None:
     line = json.dumps({"ts": now, **asdict(ev)}, ensure_ascii=False)
-    with open(store.home / "promotions.log", "a", encoding="utf-8", newline="\n") as f:
-        f.write(line + "\n")
+    try:
+        with open(store.home / "promotions.log", "a", encoding="utf-8", newline="\n") as f:
+            f.write(line + "\n")
+    except OSError as e:
+        log_line(store.home, "consolidate.log", "could not append to promotions.log", e)
 
 
 def _eligible(r: Record | None) -> bool:
@@ -61,7 +65,7 @@ def _apply(store: Store, members: list[Record], scope: str, now: str) -> str:
         new = existing
     else:
         new = Record(nid, src.kind, scope, src.project, tags, sources, src.confidence,
-                     "active", now, now, src.body)
+                     "active", min(m.created for m in members), now, src.body)
     store.save(new)
     for m in members:
         m.status, m.promoted_to = "superseded", nid
@@ -70,7 +74,13 @@ def _apply(store: Store, members: list[Record], scope: str, now: str) -> str:
 
 
 def promote(store: Store, judge, embedder, th: Thresholds, touched: list[Record],
-            shadow: bool, now: str) -> list[PromotionEvent]:
+            shadow: bool, now: str, failed: list[str] | None = None) -> list[PromotionEvent]:
+    """Promote clusters around `touched` records.
+
+    When `failed` is given, a judge error does not raise: the id of the record being judged
+    and of all remaining touched records are appended to it (to retry later), the loop stops,
+    and the events produced so far are still returned.
+    """
     events: list[PromotionEvent] = []
     vec: dict[str, np.ndarray] = {}
 
@@ -80,7 +90,7 @@ def promote(store: Store, judge, embedder, th: Thresholds, touched: list[Record]
             for t, v in zip(need, embedder.encode(need)):
                 vec[t] = np.asarray(v, dtype=float)
 
-    for t0 in touched:
+    for idx, t0 in enumerate(touched):
         t = store.get(t0.id)
         if not _eligible(t):
             continue
@@ -101,7 +111,14 @@ def promote(store: Store, judge, embedder, th: Thresholds, touched: list[Record]
                 continue  # already judged (and logged when it passed); nothing new in shadow
             v = PromotionVerdict(cached["personal"], cached["same"], cached["stable"])
         else:
-            v = judge.promotion([m.body for m in sorted(members, key=lambda m: m.id)])
+            try:
+                v = judge.promotion([m.body for m in sorted(members, key=lambda m: m.id)])
+            except Exception as e:
+                if failed is None:
+                    raise
+                log_line(store.home, "consolidate.log", "promotion judgment failed", e)
+                failed.extend(x.id for x in touched[idx:])
+                break
             stored = {"personal": v.personal, "same": v.same, "stable": v.stable}
             for m in members:
                 m.judgments[key] = stored

@@ -74,7 +74,7 @@ def recheck_new_tags(store: Store, judge, new_tags: list[str], th: Thresholds) -
         if tag not in vocab:
             continue
         for r in store.load_all():
-            if tag in r.tags or r.kind == "project-gist":
+            if tag in r.tags or r.pinned or r.kind == "project-gist":
                 continue
             if judge.fits_tag(r.body, tag, vocab[tag]) >= th.tag_reuse:
                 r.tags = [*r.tags, tag]
@@ -125,6 +125,20 @@ def run(home: Path, judge, embedder, runner, th: Thresholds, now: str,
     return rep
 
 
+def _dedupe(items) -> list:
+    return list(dict.fromkeys(items))
+
+
+def _shadow(cfg: dict, today: date, prepared: bool) -> bool:
+    """Fail closed: anything but a parseable shadow_until before today means shadow."""
+    if not prepared:
+        return True
+    try:
+        return date.fromisoformat(str(cfg.get("shadow_until"))[:10]) >= today
+    except ValueError:
+        return True
+
+
 def _pipeline(store: Store, judge, embedder, runner, th: Thresholds, now: str, full: bool,
               rep: RunReport) -> None:
     def fail(what: str, e: BaseException) -> None:
@@ -137,8 +151,11 @@ def _pipeline(store: Store, judge, embedder, runner, th: Thresholds, now: str, f
         except Exception as e:  # one stage failing must not undo or block the others
             fail(what, e)
 
+    def pending(key: str) -> list:
+        return list(store.config().get(key, []))
+
     today = _dt(now).date()
-    state: dict = {"ids": [], "tags_before": {}}
+    state: dict = {"ids": [], "tags_before": None, "prepared": False, "retag": set()}
 
     def prepare() -> None:
         cfg = store.config()
@@ -146,12 +163,15 @@ def _pipeline(store: Store, judge, embedder, runner, th: Thresholds, now: str, f
             store.set_config(shadow_until=(today + timedelta(days=SHADOW_DAYS)).isoformat())
         state["tags_before"] = dict(store.tags())
         if full:
+            # cached judgments are dropped; old tags stay until a new assignment succeeds
             for r in store.load_all():
                 if r.pinned or r.kind == "project-gist":
                     continue
-                r.judgments, r.tags = {}, []
+                r.judgments = {}
                 store.save(r)
                 state["ids"].append(r.id)
+                state["retag"].add(r.id)
+        state["prepared"] = True
 
     step("prepare", prepare)
 
@@ -165,34 +185,60 @@ def _pipeline(store: Store, judge, embedder, runner, th: Thresholds, now: str, f
     step("ingest", do_ingest)
 
     def do_tag() -> None:
-        for rid in state["ids"]:
+        ids = _dedupe([*pending("pending_tag"), *state["ids"]])
+        for idx, rid in enumerate(ids):
             r = store.get(rid)
-            if r is None or r.pinned or r.status != "active" or r.tags:
+            if r is None or r.pinned or r.status != "active":
                 continue
+            retag = rid in state["retag"]
+            if r.tags and not retag:
+                continue
+            old = list(r.tags)
+            r.tags = []
             try:
                 assign_tag(store, judge, runner, r, th)
             except Exception as e:
                 rep.jev_failed = True
                 fail("tagging", e)
+                store.set_config(pending_tag=ids[idx:])  # retried next run; old tags intact
                 return
-            if r.tags:
+            if r.tags != old:
                 store.save(r)
-                rep.tagged += 1
+                if r.tags:
+                    rep.tagged += 1
+        store.set_config(pending_tag=[])
 
     step("tagging", do_tag)
 
     def note_new_tags() -> None:
+        if state["tags_before"] is None:
+            return
         rep.new_tags = [t for t in store.tags() if t not in state["tags_before"]]
         if rep.new_tags:
-            pending = store.config().get("pending_recheck", [])
-            store.set_config(pending_recheck=[*pending, *rep.new_tags])
+            store.set_config(pending_recheck=_dedupe([*pending("pending_recheck"),
+                                                      *rep.new_tags]))
 
     step("new tags", note_new_tags)
 
     def do_promote() -> None:
-        shadow = str(store.config().get("shadow_until", "")) >= today.isoformat()
-        touched = [r for r in (store.get(i) for i in state["ids"]) if r is not None]
-        rep.promotions = promote(store, judge, embedder, th, touched, shadow, now)
+        cfg = store.config()
+        shadow = _shadow(cfg, today, state["prepared"])
+        ids = _dedupe([*pending("pending_promote"), *state["ids"]])
+        sweep_all = not shadow and not cfg.get("shadow_applied")
+        if sweep_all:  # shadow just ended: apply verdicts cached during shadow (one pass)
+            ids = _dedupe([*ids, *(r.id for r in store.load_all(scope="project")
+                                   if not r.pinned and r.kind != "project-gist")])
+        touched = [r for r in (store.get(i) for i in ids) if r is not None]
+        failed: list[str] = []
+        rep.promotions = promote(store, judge, embedder, th, touched, shadow, now, failed)
+        if failed:
+            rep.jev_failed = True
+            rep.errors.append("promotion: judge failed; will retry next run")
+            store.set_config(pending_promote=_dedupe(failed))
+            return
+        store.set_config(pending_promote=[])
+        if sweep_all:
+            store.set_config(shadow_applied=True)
 
     step("promotion", do_promote)
 
@@ -218,10 +264,10 @@ def _pipeline(store: Store, judge, embedder, runner, th: Thresholds, now: str, f
             return
         rep.swept = True
         rep.decayed = decay(store, th, now)
-        pending = store.config().get("pending_recheck", [])
-        if pending:
+        todo = _dedupe(pending("pending_recheck"))
+        if todo:
             try:
-                rep.rechecked = recheck_new_tags(store, judge, pending, th)
+                rep.rechecked = recheck_new_tags(store, judge, todo, th)
             except Exception as e:
                 rep.jev_failed = True
                 fail("tag recheck", e)
@@ -234,10 +280,12 @@ def _pipeline(store: Store, judge, embedder, runner, th: Thresholds, now: str, f
 
     def do_commit() -> None:
         i = rep.ingest
+        applied = sum(1 for e in rep.promotions if e.applied)
         msg = (f"consolidate: {len(i.created)} new, {len(i.merged)} merged, "
-               f"{len(i.superseded)} superseded, "
-               f"{sum(1 for e in rep.promotions if e.applied)} promoted"
-               f" ({len(rep.promotions)} candidates), {len(rep.new_tags)} new tags")
+               f"{len(i.superseded)} superseded, {applied} promoted, "
+               f"{len(rep.promotions) - applied} shadow-logged, "
+               f"{rep.tagged} tagged, {len(rep.new_tags)} new tags"
+               + (", jev failed (will retry)" if rep.jev_failed else ""))
         rep.committed = store.commit(msg)
 
     try:
