@@ -1,7 +1,7 @@
 import pytest
 
 from learned.config import Thresholds
-from learned.ingest import ingest
+from learned.ingest import can_supersede, ingest
 from learned.models import Candidate, WindowVerdict
 from learned.records import Record, new_id
 from learned.store import Store
@@ -72,7 +72,7 @@ def test_unclassified_candidate_is_classified_at_ingest(store):
     j = FakeJudge(classify_window=lambda t, c: WindowVerdict("decision", 0.8, 0.0))
     ingest(store, j, FakeEmbedder({"use sqlite": [1, 0]}), TH, NOW)
     (r,) = store.load_all()
-    assert r.kind == "decision" and r.confidence == "inferred"
+    assert r.kind == "decision" and r.confidence == "stated"
 
 
 def test_none_kind_after_classification_is_dropped(store):
@@ -112,16 +112,13 @@ def test_contradiction_supersedes_older_stated_loses_to_newer_stated(store):
     assert rep.superseded == [old.id]
 
 
-def test_inferred_never_supersedes_stated(store):
-    old = rec("use tabs", confidence="stated")
-    store.save(old)
-    put(store, "s2.jsonl", [cand("use spaces", kind=None, prob=0.0, session="s2")])
-    j = FakeJudge(classify_window=lambda t, c: WindowVerdict("decision", 0.9, 0.0),
-                  contradicts=lambda a, b: 0.95)
-    rep = ingest(store, j, emb(use_tabs=[1, 0], use_spaces=[0.9, 0.3]), TH, NOW)
-    assert store.get(old.id).status == "active"
-    assert [r.body for r in store.load_all()] == ["use tabs"]
-    assert rep.superseded == [] and rep.skipped == 1
+def test_inferred_never_supersedes_stated():
+    stated, inferred = rec("use tabs"), rec("use spaces", confidence="inferred")
+    assert can_supersede(stated, inferred) is True       # stated beats inferred
+    assert can_supersede(stated, rec("x", confidence="stated")) is True  # newer stated wins
+    assert can_supersede(inferred, stated) is False      # inferred never supersedes stated
+    assert can_supersede(inferred, rec("y", confidence="inferred")) is True
+    assert can_supersede(stated, rec("z", pinned=True)) is False
 
 
 def test_pinned_record_not_superseded_but_gains_sources(store):
@@ -153,13 +150,15 @@ def test_neighbors_limited_to_k_and_cutoff(store):
     assert j.calls.count("same_fact") == 3 and j.calls.count("contradicts") == 3
 
 
-def test_same_project_neighbors_come_first(store):
-    store.save(rec("other fact", project="q"))
+def test_neighbors_are_same_project_then_promoted_never_other_projects(store):
+    store.save(rec("other fact", project="q", scope="topic"))
+    store.save(rec("other project fact", project="q"))
     store.save(rec("mine", project="p"))
     put(store, "s1.jsonl", [cand("new")])
     seen = []
     j = FakeJudge(same_fact=lambda a, b: seen.append(b) or 0.0)
-    ingest(store, j, FakeEmbedder({"other fact": [1, 0], "mine": [0.8, 0.6], "new": [1, 0]}),
+    ingest(store, j, FakeEmbedder({"other fact": [1, 0], "mine": [0.8, 0.6], "new": [1, 0],
+                       "other project fact": [1, 0]}),
            TH, NOW)
     assert seen == ["mine", "other fact"]
 
@@ -181,10 +180,13 @@ def test_judge_exception_keeps_inbox_file_and_flags_failure(store):
 def test_tombstoned_text_is_skipped(store):
     store.add_tombstone("forgotten thing")
     put(store, "s1.jsonl", [cand("forgotten thing again")])
-    rep = ingest(store, FakeJudge(),
+    judge = Counting(classify_window=lambda t, c: WindowVerdict("rejection", 0.9, 0.0),
+                     same_fact=lambda a, b: 0.0, contradicts=lambda a, b: 0.0)
+    rep = ingest(store, judge,
                  emb(forgotten_thing=[1, 0], forgotten_thing_again=[0.99, 0.05]), TH, NOW)
     assert store.load_all() == [] and rep.skipped == 1
     assert (store.home / "inbox" / "processed" / "s1.jsonl").exists()
+    assert judge.calls == []
 
 
 def test_rerun_after_partial_failure_does_not_duplicate(store):
@@ -203,3 +205,44 @@ def test_rerun_after_partial_failure_does_not_duplicate(store):
     rep2 = ingest(store, FakeJudge(), e, TH, NOW)
     assert not rep2.jev_failed
     assert sorted(r.body for r in store.load_all()) == ["first", "second", "seed"]
+
+
+def test_same_fact_in_two_projects_stays_two_records(store):
+    put(store, "a.jsonl", [cand("always use uv", project="alpha", session="sa")])
+    put(store, "b.jsonl", [cand("prefer uv over pip", project="beta", session="sb")])
+    j = FakeJudge(same_fact=lambda a, b: 0.95)
+    rep = ingest(store, j, FakeEmbedder({"always use uv": [1, 0], "prefer uv over pip": [0.95, 0.1]}),
+                 TH, NOW)
+    assert sorted(r.project for r in store.load_all()) == ["alpha", "beta"]
+    assert rep.merged == [] and len(rep.created) == 2
+
+
+def test_promoted_scope_records_are_neighbors_for_any_project(store):
+    g = rec("always use uv", project="alpha", scope="global")
+    store.save(g)
+    put(store, "b.jsonl", [cand("prefer uv over pip", project="beta", session="sb")])
+    j = FakeJudge(same_fact=lambda a, b: 0.95)
+    rep = ingest(store, j, FakeEmbedder({"always use uv": [1, 0], "prefer uv over pip": [0.95, 0.1]}),
+                 TH, NOW)
+    assert rep.merged and rep.merged[0][1] == g.id and rep.created == []
+    assert store.get(g.id).sources == ["old", "sb"]
+
+
+GOOD_FIELDS = '"context": "", "kind": null, "kind_prob": 0, "project": "p", "cwd": "", ' \
+              '"session_id": "s", "timestamp": ""'
+
+
+@pytest.mark.parametrize("bad", ["[1, 2]", '{"text": "x"}', "not json", "5",
+                                 '{"text": 3, ' + GOOD_FIELDS + "}"])
+def test_poison_line_moves_file_to_rejected_and_ingest_continues(store, bad):
+    good = cand("fine fact")
+    p = store.home / "inbox" / "a.jsonl"
+    p.write_text(good.to_json() + "\n" + bad + "\n", encoding="utf-8")
+    put(store, "b.jsonl", [cand("other fact", session="s2")])
+    rep = ingest(store, FakeJudge(), FakeEmbedder({"fine fact": [1, 0], "other fact": [0, 1]}),
+                 TH, NOW)
+    assert (store.home / "inbox" / "rejected" / "a.jsonl").exists() and not p.exists()
+    assert [r.body for r in store.load_all()] == ["other fact"] and rep.created
+    assert "a.jsonl" in (store.home / "consolidate.log").read_text(encoding="utf-8")
+
+

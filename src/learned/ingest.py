@@ -1,7 +1,12 @@
 """Ingest: inbox candidates -> classified, deduplicated, merged or superseding records.
 
-Judge and embedder are injected. Processed inbox files move to inbox/processed/.
-If the judge raises, the inbox file stays unprocessed and report.jev_failed is set.
+Judge and embedder are injected. Processed inbox files move to inbox/processed/, files with
+malformed lines to inbox/rejected/. If the judge raises, the inbox file stays unprocessed
+and report.jev_failed is set.
+
+Dedupe neighbours are the same project's records plus topic/global ones. Near-duplicates in
+other projects deliberately stay separate records so promotion can see the cross-project
+cluster.
 """
 from __future__ import annotations
 
@@ -12,6 +17,7 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from .config import Thresholds
+from .logutil import log_line
 from .models import Candidate
 from .records import Record, new_id
 from .store import Store
@@ -50,8 +56,8 @@ class _Vectors:
         return self.cache[text]
 
 
-def _move_processed(store: Store, path) -> None:
-    dest_dir = store.home / "inbox" / "processed"
+def _move_to(store: Store, path, subdir: str) -> None:
+    dest_dir = store.home / "inbox" / subdir
     dest_dir.mkdir(parents=True, exist_ok=True)
     dest = dest_dir / path.name
     if dest.exists():
@@ -59,16 +65,31 @@ def _move_processed(store: Store, path) -> None:
     os.replace(path, dest)
 
 
-def _read_candidates(path) -> tuple[list[Candidate], int]:
-    out, bad = [], 0
-    for ln in path.read_text(encoding="utf-8").splitlines():
+def _read_candidates(path) -> list[Candidate]:
+    """Parse an inbox file; raises ValueError naming the first malformed line."""
+    out = []
+    for n, ln in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
         if not ln.strip():
             continue
         try:
-            out.append(Candidate.from_json(ln))
-        except (ValueError, TypeError):
-            bad += 1
-    return out, bad
+            c = Candidate.from_json(ln)
+            if not (isinstance(c.text, str) and isinstance(c.project, str)
+                    and isinstance(c.session_id, str) and isinstance(c.context, str)
+                    and (c.kind is None or isinstance(c.kind, str))
+                    and isinstance(c.kind_prob, (int, float))):
+                raise TypeError("bad field types")
+        except Exception as e:  # json errors, non-objects, missing fields, wrong types
+            raise ValueError(f"line {n}: {type(e).__name__}") from e
+        out.append(c)
+    return out
+
+
+def can_supersede(new: Record, old: Record) -> bool:
+    """A new record may supersede an older one unless the old one is pinned, or is stated
+    while the new one is only inferred."""
+    if old.pinned:
+        return False
+    return not (old.confidence == "stated" and new.confidence != "stated")
 
 
 def _call(fn, *args):
@@ -95,24 +116,35 @@ def ingest(store: Store, judge, embedder, th: Thresholds, now: str) -> IngestRep
         return any(float(v @ vecs.get(t)) >= th.tombstone_sim for t in tomb_texts)
 
     def neighbors(c: Candidate) -> list[Record]:
-        if not active:
+        pool = [r for r in active if r.scope != "project" or r.project == c.project]
+        if not pool:
             return []
-        vecs.ensure([c.text] + [r.body for r in active])
+        vecs.ensure([c.text] + [r.body for r in pool])
         v = vecs.get(c.text)
-        scored = [(float(v @ vecs.get(r.body)), r) for r in active]
+        scored = [(float(v @ vecs.get(r.body)), r) for r in pool]
         scored = [(s, r) for s, r in scored if s >= th.neighbor_sim]
         scored.sort(key=lambda x: -x[0])
-        ordered = [r for s, r in scored if r.project == c.project] + \
-                  [r for s, r in scored if r.project != c.project]
-        return ordered[: th.neighbor_k]
+        same_project = [r for s, r in scored if r.scope == "project"]
+        promoted = [r for s, r in scored if r.scope != "project"]
+        return (same_project + promoted)[: th.neighbor_k]
 
     def touch(r: Record) -> None:
         if r.id not in rep.touched:
             rep.touched.append(r.id)
         rep.projects.add(r.project)
 
+    def merge(target: Record, c: Candidate, cand_id: str) -> None:
+        if c.session_id not in target.sources:
+            target.sources = [*target.sources, c.session_id]
+        if not target.pinned:
+            target.last_seen = now
+            target.stale = False
+        store.save(target)
+        rep.merged.append((cand_id, target.id))
+        touch(target)
+
     def process(c: Candidate) -> None:
-        kind, prob, stated = c.kind, c.kind_prob, True
+        kind = c.kind
         if kind == "none":
             rep.skipped += 1
             return
@@ -125,55 +157,52 @@ def ingest(store: Store, judge, embedder, th: Thresholds, now: str) -> IngestRep
                     or v.sensitive_prob >= th.sensitive_drop:
                 rep.skipped += 1
                 return
-            kind, prob, stated = v.kind, v.kind_prob, False  # classified late: inferred
+            kind = v.kind
         cand_id = new_id(c.text, c.project, "project")
-        by_id = next((r for r in active if r.id == cand_id), None)
+        by_id = next((r for r in active
+                      if r.id == cand_id and r.scope == "project"), None)
         if by_id is not None:  # same text already stored (e.g. rerun after a partial failure)
-            _merge(by_id, c, cand_id)
+            merge(by_id, c, cand_id)
             return
         nbs = neighbors(c)
         for nb in nbs:
             if _call(judge.same_fact, c.text, nb.body) >= th.same_fact:
-                _merge(nb, c, cand_id)
+                merge(nb, c, cand_id)
                 return
         contradicted = [nb for nb in nbs
                         if _call(judge.contradicts, c.text, nb.body) >= th.contradiction]
-        if stated:
-            if any(nb.pinned for nb in contradicted):
-                rep.skipped += 1
-                return
-            for nb in contradicted:
-                nb.status = "superseded"
-                store.save(nb)
-                active.remove(nb)
-                rep.superseded.append(nb.id)
-        elif any(nb.pinned or nb.confidence == "stated" for nb in contradicted):
+        # the text is what the user typed, so the record is always 'stated'
+        r = Record(cand_id, kind, "project", c.project, [], [c.session_id],
+                   "stated", "active", now, now, c.text)
+        if any(not can_supersede(r, nb) for nb in contradicted):
             rep.skipped += 1
             return
-        r = Record(cand_id, kind, "project", c.project, [], [c.session_id],
-                   "stated" if stated else "inferred", "active", now, now, c.text)
+        for nb in contradicted:
+            nb.status = "superseded"
+            store.save(nb)
+            active.remove(nb)
+            rep.superseded.append(nb.id)
         store.save(r)
         active.append(r)
         vecs.ensure([r.body])
         rep.created.append(r.id)
         touch(r)
 
-    def _merge(target: Record, c: Candidate, cand_id: str) -> None:
-        if c.session_id not in target.sources:
-            target.sources = [*target.sources, c.session_id]
-        if not target.pinned:
-            target.last_seen = now
-            target.stale = False
-        store.save(target)
-        rep.merged.append((cand_id, target.id))
-        touch(target)
-
     for path in files:
         try:
-            cands, bad = _read_candidates(path)
-        except (OSError, UnicodeDecodeError):
+            cands = _read_candidates(path)
+        except ValueError as e:
+            log_line(store.home, "consolidate.log",
+                     f"inbox file {path.name} rejected (malformed): {e}")
+            try:
+                _move_to(store, path, "rejected")
+            except OSError as e2:
+                log_line(store.home, "consolidate.log",
+                         f"could not move {path.name} to inbox/rejected", e2)
             continue
-        rep.skipped += bad
+        except (OSError, UnicodeDecodeError) as e:
+            log_line(store.home, "consolidate.log", f"inbox file {path.name} unreadable", e)
+            continue
         try:
             for c in cands:
                 process(c)
@@ -181,7 +210,8 @@ def ingest(store: Store, judge, embedder, th: Thresholds, now: str) -> IngestRep
             rep.jev_failed = True
             break  # keep this file (and the rest) for the next run
         try:
-            _move_processed(store, path)
-        except OSError:
-            pass
+            _move_to(store, path, "processed")
+        except OSError as e:
+            log_line(store.home, "consolidate.log",
+                     f"could not move {path.name} to inbox/processed", e)
     return rep
