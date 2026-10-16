@@ -41,7 +41,8 @@ def test_init_creates_layout_and_git_repo(tmp_path):
     assert (h / "tags.json").exists()
     assert (h / ".git").exists()
     ign = (h / ".gitignore").read_text(encoding="utf-8")
-    assert ".lock" in ign and "inbox/.done" in ign and "capture.log" in ign
+    assert ".lock" in ign and "inbox/" in ign.splitlines() and "capture.log" in ign
+    assert "*.tmp" in ign.splitlines()
 
 
 def test_init_idempotent(tmp_path):
@@ -209,3 +210,22 @@ def test_commit_raises_when_git_fails(tmp_path):
     # a parent directory that is not a repo either, so git add fails
     with pytest.raises(RuntimeError):
         s.commit("x")
+
+
+def test_commit_untracks_previously_tracked_inbox_and_ignores_inbox(tmp_path):
+    import subprocess
+    s = Store(tmp_path / "s")
+    s.init()
+    inbox = s.home / "inbox"
+    inbox.mkdir(exist_ok=True)
+    (inbox / "a.jsonl").write_text("x\n", encoding="utf-8")
+    # simulate an older store that tracked the inbox
+    s._git("add", "-f", "inbox/a.jsonl")
+    s._git("commit", "-q", "-m", "old")
+    assert s._git("ls-files", "inbox").stdout.strip()
+    (inbox / "b.jsonl").write_text("y\n", encoding="utf-8")
+    (inbox / "c.jsonl.123.tmp").write_text("z\n", encoding="utf-8")
+    assert s.commit("x") is True
+    assert s._git("ls-files", "inbox").stdout.strip() == ""
+    assert (inbox / "a.jsonl").exists()  # files stay on disk
+    assert s.commit("again") is False

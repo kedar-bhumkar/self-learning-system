@@ -400,3 +400,19 @@ def test_pending_recheck_has_no_duplicates(home):
     put(home, "s1.jsonl", [cand("always use uv")])
     run(home, FakeJudge(), emb("always use uv"), Runner(), TH, NOW)
     assert store.config()["pending_recheck"] == ["x", "tooling"]
+
+
+def test_inbox_never_tracked_even_after_jev_failure_run(home):
+    put(home, "s1.jsonl", [cand("new fact")])
+    Store(home).save(rec("seed fact"))
+
+    def boom(a, b):
+        raise RuntimeError("down")
+
+    rep = run(home, FakeJudge(same_fact=boom), emb("seed fact", "new fact"), Runner(), TH, NOW)
+    assert rep.jev_failed and (home / "inbox" / "s1.jsonl").exists()
+    put(home, "s2.jsonl", [cand("other", session="s2")])
+    run(home, FakeJudge(), emb("seed fact", "new fact", "other"), Runner(), TH, NOW)
+    out = subprocess.run(["git", "-C", str(home), "ls-files", "inbox"], capture_output=True,
+                         text=True, encoding="utf-8").stdout
+    assert out.strip() == ""
