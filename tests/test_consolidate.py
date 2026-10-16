@@ -416,3 +416,12 @@ def test_inbox_never_tracked_even_after_jev_failure_run(home):
     out = subprocess.run(["git", "-C", str(home), "ls-files", "inbox"], capture_output=True,
                          text=True, encoding="utf-8").stdout
     assert out.strip() == ""
+
+
+def test_run_on_completely_empty_store(tmp_path):
+    h = tmp_path / "fresh"  # no dirs, no config, no git, no inbox
+    rep = run(h, FakeJudge(), FakeEmbedder({}), Runner(), TH, NOW)
+    assert rep.errors == [] and not rep.locked
+    assert (h / "core.md").read_text(encoding="utf-8") == ""
+    assert len(git_log(h)) == 1 and rep.committed
+    assert not (h / ".lock").exists()
