@@ -41,7 +41,7 @@ def test_init_creates_layout_and_git_repo(tmp_path):
     assert (h / "tags.json").exists()
     assert (h / ".git").exists()
     ign = (h / ".gitignore").read_text(encoding="utf-8")
-    assert ".lock" in ign and "inbox/.done" in ign
+    assert ".lock" in ign and "inbox/.done" in ign and "capture.log" in ign
 
 
 def test_init_idempotent(tmp_path):
@@ -123,7 +123,7 @@ def test_thresholds_defaults():
 def test_commit_returns_false_when_clean(tmp_path):
     s = Store(tmp_path)
     s.init()
-    assert s.commit("first") in (True, False)
+    assert s.commit("first") is True  # .gitignore + tags.json are new
     assert s.commit("again") is False
     s.save(mk())
     assert s.commit("add") is True
@@ -145,6 +145,67 @@ def test_project_name_is_always_a_safe_single_component(monkeypatch, tmp_path):
     assert project_name(r"C:\x\..") == "root"
     assert project_name(r"C:\x\a?b*c") == "a_b_c"
     assert project_name(str(tmp_path / "h")) == "home"
-    for bad in ("D:\\", r"C:\a\b:c", "con", "../..", "a/../..", "x\..\.."):
+    for bad in ("D:\\", r"C:\a\b:c", "con", "../..", "a/../..", r"x\..\.."):
         n = project_name(bad)
-        assert n and n not in (".", "..") and not set(n) & set('/\:*?"<>|')
+        assert n and n not in (".", "..") and not set(n) & set('/\\:*?"<>|')
+
+
+import pytest
+
+
+@pytest.mark.parametrize("fname,call", [
+    ("tags.json", lambda s: s.add_tag("a", "b")),
+    ("tombstones.json", lambda s: s.add_tombstone("x")),
+    ("config.json", lambda s: s.set_config(a=1)),
+])
+def test_mutators_raise_on_corrupt_json_and_leave_file_untouched(tmp_path, fname, call):
+    s = Store(tmp_path)
+    s.init()
+    f = tmp_path / fname
+    f.write_text("{not json", encoding="utf-8")
+    with pytest.raises(ValueError):
+        call(s)
+    assert f.read_text(encoding="utf-8") == "{not json"
+
+
+def test_plain_reads_return_defaults_on_corrupt_json(tmp_path):
+    s = Store(tmp_path)
+    s.init()
+    for n in ("tags.json", "tombstones.json", "config.json"):
+        (tmp_path / n).write_text("{bad", encoding="utf-8")
+    assert s.tags() == {} and s.tombstones() == [] and s.config() == {}
+
+
+def test_writes_leave_no_temp_files(tmp_path):
+    s = Store(tmp_path)
+    s.init()
+    s.add_tag("a", "b")
+    s.set_config(x=1)
+    s.save(mk())
+    assert not list(tmp_path.rglob("*.tmp"))
+
+
+def test_init_appends_missing_ignore_lines_to_existing_gitignore(tmp_path):
+    (tmp_path / ".gitignore").write_text("custom\n", encoding="utf-8")
+    s = Store(tmp_path)
+    s.init()
+    lines = (tmp_path / ".gitignore").read_text(encoding="utf-8").splitlines()
+    assert "custom" in lines and "capture.log" in lines and ".lock" in lines
+
+
+def test_parse_record_missing_fields_is_valueerror_and_skipped(tmp_path):
+    with pytest.raises(ValueError):
+        parse_record('---\nid: "x"\nkind: "rejection"\n---\nbody\n')
+    s = Store(tmp_path)
+    s.init()
+    (tmp_path / "global" / "x.md").write_text('---\nid: "x"\n---\nbody\n', encoding="utf-8")
+    assert s.get("x") is None
+    assert s.load_all() == []
+
+
+def test_commit_raises_when_git_fails(tmp_path):
+    s = Store(tmp_path / "nogit")  # directory never initialised: no repo here
+    (tmp_path / "nogit").mkdir()
+    # a parent directory that is not a repo either, so git add fails
+    with pytest.raises(RuntimeError):
+        s.commit("x")

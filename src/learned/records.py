@@ -61,4 +61,7 @@ def parse_record(text: str) -> Record:
         data[key.strip()] = json.loads(val.strip())
     data["body"] = "\n".join(lines[end + 1:]).strip("\n")
     known = {k: v for k, v in data.items() if k in _FM_FIELDS or k == "body"}
-    return Record(**known)
+    try:
+        return Record(**known)
+    except TypeError as e:  # missing required fields
+        raise ValueError(f"incomplete record: {e}") from None
