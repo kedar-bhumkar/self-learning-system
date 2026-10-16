@@ -4,6 +4,8 @@ from pathlib import Path
 
 import pytest
 
+from learned.config import Thresholds
+
 from eval import run_eval
 from eval.run_eval import (capture_metrics, dedupe_metrics, main, promotion_sweep,
                            suggest_promote_global, tag_metrics)
@@ -117,22 +119,165 @@ def test_bad_args_and_missing_file_exit_nonzero_without_traceback(tmp_path, caps
     assert "Traceback" not in err and err.strip()
 
 
-def test_harness_never_writes_config_or_store(tmp_path):
-    store = tmp_path / "store"
-    store.mkdir()
-    (store / "tags.json").write_text("{}", encoding="utf-8")
+ALL_MODES_ROWS = [
+    {"mode": "capture", "text": "No uv", "context": "", "expected_kind": "rejection"},
+    {"mode": "dedupe", "a": "x", "b": "y", "same": False},
+    {"mode": "tag", "text": "t", "tags": {"a": "A"}, "expected": "a"},
+    {"mode": "promote", "texts": ["a", "b"], "expected": "global"},
+]
+MODES = ("capture", "dedupe", "tag", "promote")
 
-    def digest():
-        h = hashlib.sha256()
-        for p in [ROOT / "src/learned/config.py", *sorted(store.rglob("*"))]:
-            if p.is_file():
-                h.update(p.read_bytes())
-        return h.hexdigest()
 
-    labels = write_labels(tmp_path / "l.jsonl", [
-        {"mode": "promote", "texts": ["a"], "expected": "none"}])
-    before = digest()
-    for mode in ("capture", "dedupe", "tag", "promote"):
-        main(["--mode", mode, "--labeled", str(labels)], judge=FakeJudge())
-    assert digest() == before
+def test_harness_never_writes_config_or_creates_files(tmp_path, monkeypatch):
+    # The store is only reachable via learned_home(); main never imports Store, so the
+    # no-new-files assertion over tmp_path (cwd and LEARNED_HOME) is the store guarantee.
+    work = tmp_path / "work"
+    work.mkdir()
+    labels = write_labels(work / "l.jsonl", ALL_MODES_ROWS)
+    monkeypatch.setenv("LEARNED_HOME", str(work / "home"))
+    monkeypatch.chdir(work)
+    cfg = ROOT / "src/learned/config.py"
+    before_cfg = hashlib.sha256(cfg.read_bytes()).hexdigest()
+    before_files = sorted(p for p in tmp_path.rglob("*"))
+    for mode in MODES:
+        assert main(["--mode", mode, "--labeled", str(labels)], judge=FakeJudge()) == 0
+    assert sorted(p for p in tmp_path.rglob("*")) == before_files
+    assert Path.cwd() == work
+    assert hashlib.sha256(cfg.read_bytes()).hexdigest() == before_cfg
     assert run_eval.__doc__ and "never" in run_eval.__doc__.lower()
+
+
+@pytest.mark.parametrize("mode", MODES)
+def test_fake_banner_in_every_mode(tmp_path, capsys, mode):
+    labels = write_labels(tmp_path / "l.jsonl", ALL_MODES_ROWS)
+    assert main(["--mode", mode, "--labeled", str(labels)], judge=FakeJudge()) == 0
+    assert "FAKE JUDGE — smoke run only" in capsys.readouterr().out
+
+
+def test_banner_on_cp1252_stream(tmp_path, monkeypatch):
+    import io
+    buf = io.BytesIO()
+    stream = io.TextIOWrapper(buf, encoding="cp1252", errors="replace")
+    monkeypatch.setattr("sys.stdout", stream)
+    labels = write_labels(tmp_path / "l.jsonl", ALL_MODES_ROWS)
+    assert main(["--mode", "capture", "--labeled", str(labels)], judge=FakeJudge()) == 0
+    stream.flush()
+    assert "FAKE JUDGE" in buf.getvalue().decode("utf-8", errors="replace")
+
+
+@pytest.mark.parametrize("row,fragment", [
+    ({"mode": "capture", "text": "t", "context": "", "expected_kind": "rejecton"},
+     "expected_kind"),
+    ({"mode": "capture", "text": "t"}, "missing field(s) expected_kind"),
+    ({"mode": "dedupe", "a": "x", "b": "y", "same": "false"}, "same must be a JSON boolean"),
+    ({"mode": "tag", "text": "t", "tags": ["a"], "expected": None}, "tags must be an object"),
+    ({"mode": "promote", "texts": [], "expected": "none"}, "non-empty list"),
+    ({"mode": "promote", "texts": ["a"], "expected": "globl"}, "expected"),
+])
+def test_label_validation_errors(tmp_path, capsys, row, fragment):
+    labels = write_labels(tmp_path / "l.jsonl", [row])
+    assert main(["--mode", row["mode"], "--labeled", str(labels)], judge=FakeJudge()) == 2
+    err = capsys.readouterr().err
+    assert fragment in err and f"{labels}:2:" in err and len(err.strip().splitlines()) == 1
+
+
+def test_empty_mode_is_an_error(tmp_path, capsys):
+    labels = write_labels(tmp_path / "l.jsonl", [ALL_MODES_ROWS[0]])
+    assert main(["--mode", "tag", "--labeled", str(labels)], judge=FakeJudge()) == 2
+    assert "no rows for mode tag" in capsys.readouterr().err
+
+
+def test_help_returns_zero(capsys):
+    assert main(["-h"]) == 0
+
+
+def test_predict_kind_drops_low_prob_and_sensitive():
+    th = Thresholds()
+    pk = run_eval._predict_kind
+    assert pk(FakeJudge(classify_window=lambda t, c: WindowVerdict("decision", 0.9, 0.0)),
+              "t", "", th) == "decision"
+    assert pk(FakeJudge(classify_window=lambda t, c: WindowVerdict("decision", 0.59, 0.0)),
+              "t", "", th) == "none"
+    assert pk(FakeJudge(classify_window=lambda t, c: WindowVerdict("decision", 0.9, 0.5)),
+              "t", "", th) == "none"
+    assert pk(FakeJudge(classify_window=lambda t, c: WindowVerdict("none", 0.99, 0.0)),
+              "t", "", th) == "none"
+
+
+def test_run_tag_exact_rates():
+    verdicts = {
+        "r1": TagVerdict("a", {"a": 0.9, "none": 0.05}),
+        "r2": TagVerdict("a", {"a": 0.7, "none": 0.1}),
+        "n": TagVerdict(None, {"a": 0.1, "none": 0.85}),
+        "u": TagVerdict(None, {"a": 0.3, "none": 0.3}),
+    }
+    rows = [{"text": "r1", "tags": {"a": "A"}, "expected": "a"},
+            {"text": "r2", "tags": {"a": "A"}, "expected": "b"},
+            {"text": "n", "tags": {"a": "A"}, "expected": None},
+            {"text": "u", "tags": {"a": "A"}, "expected": None}]
+    judge = FakeJudge(choose_tag=lambda t, tags: verdicts[t])
+    out = run_eval.run_tag(rows, judge, Thresholds())
+    assert out.splitlines()[3].split() == ["0.500", "0.250", "0.250", "0.500"]
+
+
+def test_run_promote_gate_and_exact_confusion():
+    verdicts = {("A",): PromotionVerdict(0.97, 0.9, 0.9),    # global, passes
+                ("B",): PromotionVerdict(0.80, 0.9, 0.9),    # topic, personal low
+                ("C",): PromotionVerdict(0.99, 0.5, 0.9)}    # gate fails -> none
+    rows = [{"texts": ["A"], "expected": "global"}, {"texts": ["B"], "expected": "topic"},
+            {"texts": ["C"], "expected": "none"}]
+    judge = FakeJudge(promotion=lambda texts: verdicts[tuple(texts)])
+    out = run_eval.run_promote(rows, judge, Thresholds(), show_suggestion=True)
+    blocks = out.split("\n\npromote_global >= ")
+    b70, b85 = blocks[1], blocks[4]
+    assert b70.startswith("0.70   false-global: 1") and b85.startswith("0.85   false-global: 0")
+
+    def cells(b, pred):
+        return next(ln.split()[1:] for ln in b.splitlines() if ln.startswith(pred))
+    assert cells(b70, "none") == ["1", "0", "0"]
+    assert cells(b70, "topic") == ["0", "0", "0"]
+    assert cells(b70, "global") == ["0", "1", "1"]
+    assert cells(b85, "topic") == ["0", "1", "0"]
+    assert "suggested promote_global = 0.85" in out
+
+
+def test_no_global_rows_gives_no_vacuous_suggestion():
+    rows = [{"texts": ["A"], "expected": "topic"}]
+    out = run_eval.run_promote(rows, FakeJudge(), Thresholds(), show_suggestion=True)
+    assert "not enough labeled global rows" in out and "suggested promote_global" not in out
+
+
+def test_transcript_matching_counts(tmp_path):
+    tdir = tmp_path / "t"
+    tdir.mkdir()
+    lines = [{"type": "user", "timestamp": "t", "message": {"content": txt}}
+             for txt in ("No uv, use pip", "something unlabeled", "another unlabeled")]
+    (tdir / "s.jsonl").write_text("".join(json.dumps(x) + "\n" for x in lines), encoding="utf-8")
+    rows = [{"text": "No uv, use pip", "context": "", "expected_kind": "rejection"}]
+    judge = FakeJudge(classify_window=lambda t, c: WindowVerdict("rejection", 0.9, 0.0))
+    out = run_eval.run_capture(rows, judge, Thresholds(), tdir)
+    assert "matched to labels: 1; unlabeled: 2" in out
+    overall = next(ln for ln in out.splitlines() if ln.startswith("overall"))
+    assert overall.split()[1:] == ["1.000", "1.000", "1.000", "1", "0", "0"]
+
+
+def test_real_judge_setup_failure_is_one_line(tmp_path, capsys, monkeypatch):
+    from learned import judge as judge_mod
+
+    def boom(self):
+        raise ImportError("no sdk")
+    monkeypatch.setattr(judge_mod.JevJudge, "client", property(boom))
+    labels = write_labels(tmp_path / "l.jsonl", ALL_MODES_ROWS)
+    assert main(["--mode", "capture", "--labeled", str(labels), "--judge", "jev"]) == 2
+    err = capsys.readouterr().err
+    assert "ImportError" in err and "Traceback" not in err and len(err.strip().splitlines()) == 1
+
+
+def test_judge_errors_not_reported_as_bad_record(tmp_path, capsys):
+    labels = write_labels(tmp_path / "l.jsonl", ALL_MODES_ROWS)
+
+    def boom(t, c):
+        raise KeyError("inside judge")
+    assert main(["--mode", "capture", "--labeled", str(labels)],
+                judge=FakeJudge(classify_window=boom)) == 2
+    assert "bad labeled record" not in capsys.readouterr().err

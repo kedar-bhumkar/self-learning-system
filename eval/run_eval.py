@@ -16,6 +16,10 @@ line has a "mode" field and only lines of the selected mode are used):
     tag:     {"mode":"tag","text":str,"tags":{name:description},"expected":name|null}
     promote: {"mode":"promote","texts":[str,...],"expected":"none"|"topic"|"global"}
 
+The promote sweep varies only the `personal` axis (same and stable are fixed at
+promote_topic), mirroring promotion.py: global needs personal >= promote_global and
+same, stable >= promote_topic.
+
 eval/labeled.jsonl shipped in the repo is a SYNTHETIC example only. The user must replace it
 with real labels (30-50 facts) before trusting any number.
 """
@@ -125,6 +129,42 @@ def _f(x) -> str:
 
 # ---- modes -----------------------------------------------------------------------------
 
+_REQUIRED = {"capture": ("text", "expected_kind"), "dedupe": ("a", "b", "same"),
+             "tag": ("text", "tags", "expected"), "promote": ("texts", "expected")}
+
+
+def _validate(obj: dict, mode: str, where: str) -> None:
+    missing = [k for k in _REQUIRED[mode] if k not in obj]
+    if missing:
+        raise ValueError(f"{where}: missing field(s) {', '.join(missing)} for mode {mode}")
+    if mode == "capture":
+        if not isinstance(obj["text"], str):
+            raise ValueError(f"{where}: text must be a string")
+        if obj["expected_kind"] not in (*KINDS, "none"):
+            raise ValueError(f"{where}: expected_kind {obj['expected_kind']!r} not in "
+                             f"{[*KINDS, 'none']}")
+        if not isinstance(obj.get("context", ""), str):
+            raise ValueError(f"{where}: context must be a string")
+    elif mode == "dedupe":
+        if not isinstance(obj["a"], str) or not isinstance(obj["b"], str):
+            raise ValueError(f"{where}: a and b must be strings")
+        if not isinstance(obj["same"], bool):
+            raise ValueError(f"{where}: same must be a JSON boolean, got {obj['same']!r}")
+    elif mode == "tag":
+        if not isinstance(obj["text"], str):
+            raise ValueError(f"{where}: text must be a string")
+        if not isinstance(obj["tags"], dict):
+            raise ValueError(f"{where}: tags must be an object of name -> description")
+        if obj["expected"] is not None and not isinstance(obj["expected"], str):
+            raise ValueError(f"{where}: expected must be a tag name or null")
+    else:
+        t = obj["texts"]
+        if not isinstance(t, list) or not t or not all(isinstance(x, str) for x in t):
+            raise ValueError(f"{where}: texts must be a non-empty list of strings")
+        if obj["expected"] not in LABELS:
+            raise ValueError(f"{where}: expected {obj['expected']!r} not in {list(LABELS)}")
+
+
 def _load(path: Path, mode: str) -> list[dict]:
     rows = []
     for n, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
@@ -135,8 +175,13 @@ def _load(path: Path, mode: str) -> list[dict]:
             obj = json.loads(raw)
         except ValueError:
             raise ValueError(f"{path}:{n}: invalid JSON") from None
-        if isinstance(obj, dict) and obj.get("mode") == mode:
+        if not isinstance(obj, dict):
+            raise ValueError(f"{path}:{n}: line must be a JSON object")
+        if obj.get("mode") == mode:
+            _validate(obj, mode, f"{path}:{n}")
             rows.append(obj)
+    if not rows:
+        raise ValueError(f"no rows for mode {mode} in {path}")
     return rows
 
 
@@ -218,7 +263,9 @@ def run_promote(rows, judge, th, show_suggestion: bool) -> str:
                             [[p, *(cm[p][e] for e in LABELS)] for p in LABELS]))
     lines.append("\ncost note: a wrong global promotion is worse than a missed one, so the "
                  "suggestion is the lowest threshold with zero false-global.")
-    if show_suggestion:
+    if show_suggestion and not any(r["expected"] == "global" for r in rows):
+        lines.append("not enough labeled global rows to suggest a threshold")
+    elif show_suggestion:
         t, note = suggest_promote_global(data)
         lines.append(f"suggested promote_global = {t:.2f}  ({note})")
     else:
@@ -252,7 +299,7 @@ def main(argv: list[str] | None = None, judge=None) -> int:
     try:
         args = ap.parse_args(argv)
     except SystemExit as e:
-        return e.code if isinstance(e.code, int) and e.code else 2
+        return e.code if isinstance(e.code, int) else 2
     path = Path(args.labeled)
     if not path.is_file():
         return _fail(f"labeled file not found: {path}")
@@ -265,16 +312,17 @@ def main(argv: list[str] | None = None, judge=None) -> int:
         rows = _load(path, args.mode)
     except (ValueError, OSError) as e:
         return _fail(str(e))
-    if judge is None:
-        if args.judge == "jev":
-            from learned.judge import JevJudge  # lazy: only when the user runs it
-            judge = JevJudge()
-        else:
-            from learned.testing import FakeJudge
-            judge = FakeJudge()
     fake = args.judge == "fake"
     th = Thresholds()
     try:
+        if judge is None:
+            if fake:
+                from learned.testing import FakeJudge
+                judge = FakeJudge()
+            else:
+                from learned.judge import JevJudge  # lazy: only when the user runs it
+                judge = JevJudge()
+                judge.client  # build the client now so a missing key/SDK fails cleanly
         if args.mode == "capture":
             text = run_capture(rows, judge, th, tdir)
         elif args.mode == "dedupe":
@@ -283,9 +331,7 @@ def main(argv: list[str] | None = None, judge=None) -> int:
             text = run_tag(rows, judge, th)
         else:
             text = run_promote(rows, judge, th, show_suggestion=not fake)
-    except (KeyError, TypeError) as e:
-        return _fail(f"bad labeled record for mode {args.mode}: {e!r}")
-    except Exception as e:  # judge/API failure: one line, no traceback
+    except Exception as e:  # judge/API/setup failure: one line, no traceback
         return _fail(f"{type(e).__name__}: {e}")
     if fake:
         print(FAKE_BANNER)
