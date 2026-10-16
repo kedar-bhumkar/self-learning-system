@@ -169,8 +169,10 @@ def ingest(store: Store, judge, embedder, th: Thresholds, now: str) -> IngestRep
             if _call(judge.same_fact, c.text, nb.body) >= th.same_fact:
                 merge(nb, c, cand_id)
                 return
-        contradicted = [nb for nb in nbs
-                        if _call(judge.contradicts, c.text, nb.body) >= th.contradiction]
+        # promoted (global/topic) records need cross-project evidence to be superseded, so a
+        # single project's statement never contradicts them: they only merge or coexist
+        contradicted = [nb for nb in nbs if nb.scope == "project"
+                        and _call(judge.contradicts, c.text, nb.body) >= th.contradiction]
         # the text is what the user typed, so the record is always 'stated'
         r = Record(cand_id, kind, "project", c.project, [], [c.session_id],
                    "stated", "active", now, now, c.text)

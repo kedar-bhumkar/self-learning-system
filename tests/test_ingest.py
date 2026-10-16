@@ -246,3 +246,41 @@ def test_poison_line_moves_file_to_rejected_and_ingest_continues(store, bad):
     assert "a.jsonl" in (store.home / "consolidate.log").read_text(encoding="utf-8")
 
 
+
+
+def _global(body):
+    return rec(body, project="", scope="global")
+
+
+def test_project_statement_never_supersedes_promoted_record(store):
+    g = _global("use tabs")
+    store.save(g)
+    put(store, "s2.jsonl", [cand("use spaces", session="s2")])
+    j = Counting(contradicts=lambda a, b: 0.95)
+    rep = ingest(store, j, emb(use_tabs=[1, 0], use_spaces=[0.9, 0.3]), TH, NOW)
+    assert store.get(g.id).status == "active" and rep.superseded == []
+    assert "contradicts" not in j.calls
+    (new,) = [r for r in store.load_all() if r.scope == "project"]
+    assert new.body == "use spaces" and new.project == "p" and rep.created == [new.id]
+
+
+def test_same_fact_still_merges_into_promoted_record(store):
+    g = _global("use tabs")
+    store.save(g)
+    put(store, "s2.jsonl", [cand("tabs please", session="s2")])
+    j = FakeJudge(same_fact=lambda a, b: 0.95)
+    rep = ingest(store, j, emb(use_tabs=[1, 0], tabs_please=[0.95, 0.1]), TH, NOW)
+    (r,) = store.load_all()
+    assert r.id == g.id and r.sources == ["old", "s2"] and rep.created == []
+
+
+def test_same_project_contradiction_still_supersedes_with_promoted_neighbour(store):
+    g, old = _global("use tabs"), rec("use hard tabs")
+    store.save(g)
+    store.save(old)
+    put(store, "s2.jsonl", [cand("use spaces", session="s2")])
+    j = FakeJudge(contradicts=lambda a, b: 0.95)
+    rep = ingest(store, j, emb(use_tabs=[1, 0], use_hard_tabs=[0.99, 0.1],
+                               use_spaces=[0.9, 0.3]), TH, NOW)
+    assert rep.superseded == [old.id]
+    assert store.get(g.id).status == "active"
