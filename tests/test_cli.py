@@ -83,30 +83,55 @@ def test_forget_commit_failure_reports_but_succeeds(store, capsys, monkeypatch):
 
 
 def test_demote_moves_one_level_and_keeps_sources(store, capsys):
-    r = rec("use tabs", "global", "", tags=["style"])
+    r = rec("use tabs", "project", "p", tags=["style"])
+    r.scope = "global"
+    r.project = ""
     store.save(r)
     assert cli.main(["demote", r.id], store=store) == 0
     t = store.get(r.id)
-    assert t.scope == "topic" and t.sources == ["s1"] and t.last_seen > "2026-01-01T00:00:00Z"
+    assert t.scope == "topic" and t.sources == ["s1"] and t.tags == ["style"]
+    assert t.last_seen > "2026-01-01T00:00:00Z"
     assert not (store.home / "global" / f"{r.id}.md").exists()
     assert (store.home / "topics" / f"{r.id}.md").exists()
-    t2 = store.get(r.id)
-    t2.project = "p"
-    store.save(t2)
-    assert cli.main(["demote", r.id], store=store) == 0
+    # topic -> project needs a project: none recorded, so --project is required
+    assert cli.main(["demote", r.id], store=store) != 0
+    assert "--project" in capsys.readouterr().err
+    assert cli.main(["demote", r.id, "--project", "p"], store=store) == 0
     q = store.get(r.id)
-    assert q.scope == "project" and q.sources == ["s1"]
+    assert q.scope == "project" and q.project == "p" and q.sources == ["s1"]
     assert (store.home / "projects" / "p" / f"{r.id}.md").exists()
     assert not (store.home / "topics" / f"{r.id}.md").exists()
     assert cli.main(["demote", r.id], store=store) != 0
     assert "project" in capsys.readouterr().err
 
 
-def test_demote_to_project_without_project_is_error(store, capsys):
-    r = rec("t fact", "topic", "")
+def test_demote_uses_record_project_and_rejects_inactive(store, capsys):
+    r = rec("t fact", "topic", "keepme")
     store.save(r)
+    assert cli.main(["demote", r.id], store=store) == 0
+    assert store.get(r.id).project == "keepme"
+    s = rec("old fact", "global", "")
+    s.status = "superseded"
+    store.save(s)
+    assert cli.main(["demote", s.id], store=store) != 0
+    assert store.get(s.id).scope == "global"
+
+
+def test_demote_save_failure_keeps_original(store, monkeypatch, capsys):
+    r = rec("keep me", "global", "")
+    store.save(r)
+
+    def boom(self, rec_):
+        raise OSError("disk full")
+    monkeypatch.setattr(Store, "save", boom)
     assert cli.main(["demote", r.id], store=store) != 0
-    assert store.get(r.id).scope == "topic"
+    assert (store.home / "global" / f"{r.id}.md").exists()
+    assert "Traceback" not in capsys.readouterr().err
+
+
+def test_help_exits_zero(capsys):
+    assert cli.main(["--help"]) == 0
+    assert cli.main(["bogus"]) == 2
 
 
 def test_pin_sets_flag_and_pinned_survives_decay(store):
@@ -126,15 +151,30 @@ def test_unknown_id_returns_nonzero_without_traceback(store, capsys):
     assert "Traceback" not in err and err.count("\n") == 4 and "nope" in err
 
 
-def test_rerun_full_uses_factory_and_runs_full(store, capsys):
-    a = rec("fact a")
-    store.save(a)
+def test_rerun_full_uses_factory_and_runs_full(store, capsys, monkeypatch):
+    from learned import consolidate
+    seen = {}
+    real = consolidate.run
+
+    def spy(*args, **kw):
+        seen.update(kw)
+        return real(*args, **kw)
+    monkeypatch.setattr(consolidate, "run", spy)
     calls = []
 
     def factory():
         calls.append(1)
         return FakeJudge(), FakeEmbedder({}), lambda prompt: ""
     assert cli.main(["rerun", "--full"], store=store, factory=factory) == 0
-    assert calls == [1]
+    assert calls == [1] and seen["full"] is True
     assert "full" in capsys.readouterr().out.lower()
     assert cli.main(["rerun"], store=store, factory=factory) != 0
+
+
+def test_rerun_reports_errors_nonzero(store, capsys, monkeypatch):
+    from learned import consolidate
+    rep = consolidate.RunReport()
+    rep.errors.append("tagging: boom")
+    monkeypatch.setattr(consolidate, "run", lambda *a, **k: rep)
+    assert cli.main(["rerun", "--full"], store=store, factory=lambda: (None, None, None)) == 1
+    assert "tagging: boom" in capsys.readouterr().err

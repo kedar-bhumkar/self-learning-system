@@ -69,16 +69,25 @@ def _forget(store: Store, a) -> int:
 
 def _demote(store: Store, a) -> int:
     r = _need(store, a.id)
+    if r.status != "active":
+        raise _Err(f"{a.id} is {r.status}, not active; cannot demote")
     nxt = _DEMOTE.get(r.scope)
     if nxt is None:
         raise _Err(f"{a.id} is already project scope; nothing to demote to")
-    if nxt == "project" and not r.project:
-        raise _Err(f"{a.id} has no project to demote into")
+    project = a.project or r.project
+    if nxt == "project" and not project:
+        raise _Err(f"{a.id} has no project; pass --project NAME to demote it into one")
+    old_path = store.path_for(r)
     old = r.scope
-    store.delete(r.id)
     r.scope = nxt
+    r.project = project
     r.last_seen = _now()
-    store.save(r)
+    new_path = store.save(r)  # write the new copy first; only then drop the old file
+    if new_path != old_path:
+        try:
+            old_path.unlink()
+        except FileNotFoundError:
+            pass
     try:
         store.commit(f"demote {r.id} {old}->{nxt}")
     except (RuntimeError, OSError) as e:
@@ -114,6 +123,8 @@ def _rerun(store: Store, a, factory) -> int:
     rep = consolidate.run(store.home, judge, embedder, runner, Thresholds(), _now(), full=True)
     if rep.locked:
         raise _Err("another consolidation run holds the lock")
+    if rep.errors:
+        raise _Err(f"full rerun finished with {len(rep.errors)} error(s); first: {rep.errors[0]}")
     print(f"full rerun done: errors={len(rep.errors)} committed={rep.committed}")
     return 0
 
@@ -126,7 +137,10 @@ def _parser() -> argparse.ArgumentParser:
     ls.add_argument("--project")
     ls.add_argument("--tag")
     for name in ("show", "forget", "demote", "pin"):
-        sub.add_parser(name).add_argument("id")
+        sp = sub.add_parser(name)
+        sp.add_argument("id")
+        if name == "demote":
+            sp.add_argument("--project")
     rr = sub.add_parser("rerun", help="force a full re-judgment")
     rr.add_argument("--full", action="store_true")
     return p
@@ -136,7 +150,7 @@ def main(argv: list[str], store: Store | None = None, factory=None) -> int:
     try:
         a = _parser().parse_args(argv)
     except SystemExit as e:
-        return e.code if isinstance(e.code, int) and e.code else 2
+        return e.code if isinstance(e.code, int) else 2
     try:
         store = store or Store(learned_home())
         if a.cmd == "rerun":
