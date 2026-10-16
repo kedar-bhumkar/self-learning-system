@@ -98,9 +98,11 @@ def test_rule_block_idempotent_removable_and_keeps_line_endings():
     assert remove_rule_block("untouched") == "untouched"
 
 
-def _run(script, home, *extra):
+def _run(script, home, *extra, learned_home=None):
     env = {**os.environ, "USERPROFILE": str(home), "HOME": str(home)}
     env.pop("LEARNED_HOME", None)
+    if learned_home:
+        env["LEARNED_HOME"] = str(learned_home)
     return subprocess.run(
         [POWERSHELL, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
          str(ROOT / "scripts" / script), "-Python", PY, *extra],
@@ -235,3 +237,47 @@ def test_shipped_files_carry_ownership_marker():
     for rel in ("skills/recall/SKILL.md", "commands/learned.md"):
         assert "learned-memory: managed" in (ROOT / rel).read_text(encoding="utf-8")
     assert "python -P -m learned.cli" in (ROOT / "commands/learned.md").read_text(encoding="utf-8")
+
+
+@pytest.mark.skipif(POWERSHELL is None, reason="PowerShell not available")
+@pytest.mark.parametrize("via_env", [False, True])
+def test_install_custom_learned_home_warns_and_needs_accept(tmp_path, via_env):
+    home = tmp_path / "home"
+    (home / ".claude").mkdir(parents=True)
+    custom = tmp_path / "elsewhere" / "learned"
+    before = _tree(home)
+    extra = () if via_env else ("-LearnedHome", str(custom))
+    kw = {"learned_home": custom} if via_env else {}
+    res = _run("install.ps1", home, "-DryRun", *extra, **kw)
+    assert res.returncode == 1, res.stderr + res.stdout
+    assert "WARNING" in res.stdout and "setx LEARNED_HOME" in res.stdout
+    assert str(custom) in res.stdout and "[1/6]" not in res.stdout
+    assert _tree(home) == before
+    res = _run("install.ps1", home, "-DryRun", "-AcceptCustomHome", *extra, **kw)
+    assert res.returncode == 0, res.stderr + res.stdout
+    assert "WARNING" in res.stdout and f"Store.init at {custom}" in res.stdout
+    assert _tree(home) == before
+
+
+@pytest.mark.skipif(POWERSHELL is None, reason="PowerShell not available")
+def test_install_default_home_has_no_warning(tmp_path):
+    home = tmp_path / "home"
+    (home / ".claude").mkdir(parents=True)
+    res = _run("install.ps1", home, "-DryRun", "-LearnedHome",
+               str(home / ".claude" / "learned") + "/")
+    assert res.returncode == 0 and "WARNING" not in res.stdout
+
+
+@pytest.mark.skipif(POWERSHELL is None, reason="PowerShell not available")
+def test_failure_report_builder_lists_steps_and_undo():
+    text = (ROOT / "scripts" / "install.ps1").read_text(encoding="utf-8")
+    start = text.index("function Format-InstallFailure")
+    fn = text[start:text.index("function Test-CustomHome")]
+    cmd = (fn + " Format-InstallFailure -Completed @('1/6 package','2/6 hooks') "
+           "-Failed '3/6 scheduled task' -Reason 'boom'")
+    res = subprocess.run([POWERSHELL, "-NoProfile", "-Command", cmd], capture_output=True,
+                         text=True, encoding="utf-8", errors="replace", timeout=60)
+    assert res.returncode == 0, res.stderr
+    assert "completed steps: 1/6 package, 2/6 hooks" in res.stdout
+    assert "failed step: 3/6 scheduled task (boom)" in res.stdout
+    assert "manual undo: run scripts" + chr(92) + "uninstall.ps1" in res.stdout
