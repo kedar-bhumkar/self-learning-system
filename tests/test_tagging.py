@@ -19,7 +19,7 @@ def store(tmp_path):
     return s
 
 
-def record(body="use ffmpeg with -y"):
+def record(body="always use ffmpeg with -y for video"):
     return Record(new_id(body), "decision", "project", "p", [], ["s"], "stated", "active",
                   "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z", body)
 
@@ -93,7 +93,8 @@ def test_new_tag_name_is_slugified_and_unique(store):
 def test_tag_named_none_never_created(store):
     runner = Runner("name: None\ndescription: nothing")
     r = assign_tag(store, judge_with(None, {}), runner, record(), TH)
-    assert r.tags == ["none-tag"] and "none" not in store.tags()
+    # "none" is a confirmation-vocabulary word, so it is now rejected as a junk name
+    assert r.tags == [] and "none" not in store.tags()
 
 
 def test_runner_failure_leaves_untagged(store):
@@ -115,3 +116,38 @@ def test_vocabulary_over_254_skips_judge_and_logs(store):
     assert r.tags == [] and calls == [] and runner.prompts == []
     log = (store.home / "consolidate.log").read_text(encoding="utf-8")
     assert "255" in log and len(log.splitlines()) == 1
+
+
+JUNK = ["digit-one-fact", "go-word-fact", "yes-word-fact", "apply-word-fact",
+        "storage-location-approval", "two-fact", "ok-approach"]
+LONG = "always render the hyperframes video with the pipeline script"
+
+
+@pytest.mark.parametrize("name", JUNK)
+def test_junk_tag_names_rejected(store, name):
+    runner = Runner(f"name: {name}\ndescription: whatever")
+    r = assign_tag(store, FakeJudge(), runner, record(LONG), TH)
+    assert r.tags == [] and store.tags() == {}
+    log = (store.home / "consolidate.log").read_text(encoding="utf-8")
+    assert len(log.strip().splitlines()) == 1
+
+
+def test_substantive_tag_still_created(store):
+    runner = Runner("name: hyperframes video pipeline\ndescription: Video rendering")
+    r = assign_tag(store, FakeJudge(), runner, record(LONG), TH)
+    assert r.tags == ["hyperframes-video-pipeline"]
+
+
+@pytest.mark.parametrize("body", ["Go", "use ffmpeg with -y"])
+def test_runner_not_called_for_bare_or_short(store, body):
+    runner = Runner()
+    r = assign_tag(store, FakeJudge(), runner, record(body), TH)
+    assert r.tags == [] and runner.prompts == []
+
+
+def test_short_fact_reuses_existing_tag(store):
+    store.add_tag("ffmpeg", "ffmpeg usage")
+    runner = Runner()
+    r = assign_tag(store, judge_with("ffmpeg", {"ffmpeg": 0.8, "none": 0.1}), runner,
+                   record("use ffmpeg"), TH)
+    assert r.tags == ["ffmpeg"] and runner.prompts == []

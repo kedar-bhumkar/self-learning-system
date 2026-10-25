@@ -67,12 +67,12 @@ def git_log(home):
 
 
 def test_full_pipeline_end_to_end_with_fakes(home):
-    put(home, "s1.jsonl", [cand("always use uv")])
+    put(home, "s1.jsonl", [cand("always use uv for python packages")])
     runner = Runner()
-    rep = run(home, FakeJudge(), emb("always use uv"), runner, TH, NOW)
+    rep = run(home, FakeJudge(), emb("always use uv for python packages"), runner, TH, NOW)
     store = Store(home)
     (r,) = store.load_all()
-    assert r.body == "always use uv" and r.tags == ["tooling"]
+    assert r.body == "always use uv for python packages" and r.tags == ["tooling"]
     assert store.tags() == {"tooling": "Tooling choices"}
     assert (home / "core.md").exists()
     assert (home / "projects" / "alpha" / "gist.md").read_text(encoding="utf-8") == GIST
@@ -397,8 +397,8 @@ def test_shadow_verdicts_applied_in_one_pass_after_shadow_ends(home):
 def test_pending_recheck_has_no_duplicates(home):
     store = Store(home)
     store.set_config(pending_recheck=["x", "x"], last_sweep="2026-10-15T00:00:00Z")
-    put(home, "s1.jsonl", [cand("always use uv")])
-    run(home, FakeJudge(), emb("always use uv"), Runner(), TH, NOW)
+    put(home, "s1.jsonl", [cand("always use uv for python packages")])
+    run(home, FakeJudge(), emb("always use uv for python packages"), Runner(), TH, NOW)
     assert store.config()["pending_recheck"] == ["x", "tooling"]
 
 
