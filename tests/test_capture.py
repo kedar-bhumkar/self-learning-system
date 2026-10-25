@@ -57,12 +57,12 @@ def work(tmp_path):
 
 
 def test_writes_classified_candidates_above_threshold(tmp_path, store):
-    t = make_transcript(tmp_path, ["no, not X", "use Y", "ok"])
+    t = make_transcript(tmp_path, ["no, not X", "use Y", "keep it short"])
     cwd = work(tmp_path)
     n = capture_session(t, "sid1", str(cwd), FakeJudge(classify_window=rejecting), store)
     assert n == 3
     cs = cands(store)
-    assert [c.text for c in cs] == ["no, not X", "use Y", "ok"]
+    assert [c.text for c in cs] == ["no, not X", "use Y", "keep it short"]
     assert cs[0].kind == "rejection" and cs[0].kind_prob == 0.9
     assert cs[0].project == "my project" and cs[0].session_id == "sid1"
     assert cs[0].timestamp.startswith("2026-")
@@ -71,16 +71,16 @@ def test_writes_classified_candidates_above_threshold(tmp_path, store):
 
 
 def test_drops_none_low_prob_and_sensitive(tmp_path, store):
-    t = make_transcript(tmp_path, ["a-none", "b-low", "c-sens", "d-good"])
+    t = make_transcript(tmp_path, ["a-none thing", "b-low thing", "c-sens thing", "d-good thing"])
 
     def judge(text, context):
-        return {"a-none": WindowVerdict("none", 0.95, 0.0),
-                "b-low": WindowVerdict("decision", 0.4, 0.0),
-                "c-sens": WindowVerdict("decision", 0.9, 0.9),
-                "d-good": WindowVerdict("decision", 0.9, 0.1)}[text]
+        return {"a-none thing": WindowVerdict("none", 0.95, 0.0),
+                "b-low thing": WindowVerdict("decision", 0.4, 0.0),
+                "c-sens thing": WindowVerdict("decision", 0.9, 0.9),
+                "d-good thing": WindowVerdict("decision", 0.9, 0.1)}[text]
 
     n = capture_session(t, "s", str(work(tmp_path)), FakeJudge(classify_window=judge), store)
-    assert n == 1 and [c.text for c in cands(store)] == ["d-good"]
+    assert n == 1 and [c.text for c in cands(store)] == ["d-good thing"]
 
 
 def test_text_is_redacted_before_judge_sees_it(tmp_path, store):
@@ -99,7 +99,7 @@ def test_text_is_redacted_before_judge_sees_it(tmp_path, store):
 
 def test_skips_when_extractor_env_set(tmp_path, store, monkeypatch):
     monkeypatch.setenv("LEARNED_EXTRACTOR", "1")
-    t = make_transcript(tmp_path, ["a", "b", "c"])
+    t = make_transcript(tmp_path, ["fact one", "fact two", "fact three"])
     assert capture_session(t, "s", str(work(tmp_path)),
                            FakeJudge(classify_window=rejecting), store) == 0
     assert not list((store.home / "inbox").glob("*.jsonl"))
@@ -108,7 +108,7 @@ def test_skips_when_extractor_env_set(tmp_path, store, monkeypatch):
 def test_skips_when_no_learn_file(tmp_path, store):
     cwd = work(tmp_path)
     (cwd / ".no-learn").write_text("", encoding="utf-8")
-    t = make_transcript(tmp_path, ["a", "b", "c"])
+    t = make_transcript(tmp_path, ["fact one", "fact two", "fact three"])
     assert capture_session(t, "s", str(cwd), FakeJudge(classify_window=rejecting), store) == 0
     assert not list((store.home / "inbox").glob("*.jsonl"))
 
@@ -139,7 +139,7 @@ def test_watermark_only_new_windows_on_second_call(tmp_path, store):
 
 
 def test_judge_failure_stores_unclassified(tmp_path, store):
-    t = make_transcript(tmp_path, ["a", "b", "c"])
+    t = make_transcript(tmp_path, ["fact one", "fact two", "fact three"])
     calls = []
 
     def boom(text, context):
@@ -153,7 +153,7 @@ def test_judge_failure_stores_unclassified(tmp_path, store):
 
 
 def test_writes_project_meta(tmp_path, store):
-    t = make_transcript(tmp_path, ["a", "b", "c"])
+    t = make_transcript(tmp_path, ["fact one", "fact two", "fact three"])
     cwd = work(tmp_path)
     capture_session(t, "s", str(cwd), FakeJudge(classify_window=rejecting), store)
     meta = store.home / "projects" / "my project" / "meta.json"
@@ -171,11 +171,11 @@ def test_main_without_api_key_stores_unclassified(tmp_path, monkeypatch):
     monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)
     home = tmp_path / "home"
     monkeypatch.setenv("LEARNED_HOME", str(home))
-    t = make_transcript(tmp_path, ["no not X", "use Y", "ok"])
+    t = make_transcript(tmp_path, ["no not X", "use Y", "keep it short"])
     cwd = work(tmp_path)
     assert capture.main([str(t), "sid", str(cwd)]) == 0
     cs = cands(Store(home))
-    assert [c.text for c in cs] == ["no not X", "use Y", "ok"]
+    assert [c.text for c in cs] == ["no not X", "use Y", "keep it short"]
     assert all(c.kind is None for c in cs)
     log = (home / "capture.log").read_text(encoding="utf-8")
     assert "judge failed" in log and len(log.splitlines()) == 1
@@ -220,3 +220,49 @@ def test_two_workers_same_session_do_not_overwrite(tmp_path, store):
     files = sorted(f.name for f in (store.home / "inbox").glob("*.jsonl"))
     assert files == ["s.1.jsonl", "s.jsonl"]
     assert not list((store.home / "inbox").glob("*.tmp"))
+
+
+def _ask_transcript(tmp_path, answer):
+    def l(type_, content, i):
+        return tline(type_, content, i)
+    lines = [
+        l("user", "first thing please", 0),
+        l("assistant", [{"type": "tool_use", "id": "q1", "name": "AskUserQuestion",
+                         "input": {"questions": [{"question": "Which storage location?"}]}}], 1),
+        l("user", [{"type": "tool_result", "tool_use_id": "q1", "content": answer}], 2),
+        l("user", "second thing please", 3),
+        l("user", "third thing please", 4),
+    ]
+    p = tmp_path / "ask.jsonl"
+    p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return p
+
+
+def test_bare_reply_dropped_before_judge(tmp_path, store):
+    t = make_transcript(tmp_path, ["Go", "no em dashes in docs", "Yes"])
+    seen = []
+
+    def classify(text, context):
+        seen.append(text)
+        return WindowVerdict("rejection", 0.9, 0.0)
+
+    n = capture_session(t, "s", str(work(tmp_path)), FakeJudge(classify_window=classify), store)
+    assert seen == ["no em dashes in docs"]
+    assert n == 1
+
+
+def test_bare_choice_answer_kept_with_question(tmp_path, store):
+    t = _ask_transcript(tmp_path, "1")
+    seen = []
+
+    def classify(text, context):
+        seen.append(text)
+        return WindowVerdict("decision", 0.9, 0.0)
+
+    capture_session(t, "s", str(work(tmp_path)), FakeJudge(classify_window=classify), store,
+                    Thresholds(min_user_turns=1))
+    texts = [c.text for c in cands(store)]
+    answer = [x for x in texts if x.startswith("1 (in reply to:")]
+    assert len(answer) == 1
+    assert "Which storage location?" in answer[0]
+    assert "1 (in reply to:" in " ".join(seen)

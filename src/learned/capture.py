@@ -10,6 +10,7 @@ import sys
 from pathlib import Path
 
 from .config import Thresholds, learned_home, project_name
+from .bare import is_bare_reply
 from .fsutil import atomic_write_text, create_numbered
 from .logutil import log_line
 from .models import Candidate
@@ -28,6 +29,16 @@ def _read_watermark(path: Path) -> int:
         return int(json.loads(path.read_text(encoding="utf-8")).get("last_line", 0))
     except (OSError, ValueError, AttributeError, TypeError):
         return 0
+
+
+def _question_of(context: str) -> str:
+    """Question portion of a choice-answer window context, whitespace-collapsed, <=300 chars.
+
+    The transcript module builds choice contexts as <assistant tail> + newline + <question>,
+    so the question is the last line; a context without a newline is the question itself.
+    """
+    last = context.strip().rsplit("\n", 1)[-1]
+    return " ".join(last.split())[:300]
 
 
 def capture_session(transcript: Path, session_id: str, cwd: str, judge, store: Store,
@@ -52,6 +63,10 @@ def capture_session(transcript: Path, session_id: str, cwd: str, judge, store: S
     judge_ok = True
     for w in new:
         text, context = redact(w.text), redact(w.context)
+        if is_bare_reply(text):
+            if not w.is_choice_answer:
+                continue  # "Go" / "Yes" / "1" alone is meaningless: no Jev call, no record
+            text = f"{text} (in reply to: {_question_of(context)})"
         kind: str | None = None
         kind_prob = 0.0
         if judge_ok:

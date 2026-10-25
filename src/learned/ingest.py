@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+from .bare import is_bare_reply
 from .config import Thresholds
 from .logutil import log_line
 from .models import Candidate
@@ -147,6 +148,9 @@ def ingest(store: Store, judge, embedder, th: Thresholds, now: str) -> IngestRep
         kind = c.kind
         if kind == "none":
             rep.skipped += 1
+            return
+        if is_bare_reply(c.text) and "(in reply to:" not in c.text:
+            rep.skipped += 1  # a bare "Go"/"Yes"/"1" is not a self-contained fact
             return
         if tombstoned(c.text):
             rep.skipped += 1

@@ -190,21 +190,21 @@ def test_tombstoned_text_is_skipped(store):
 
 
 def test_rerun_after_partial_failure_does_not_duplicate(store):
-    put(store, "s1.jsonl", [cand("first"), cand("second")])
+    put(store, "s1.jsonl", [cand("first fact"), cand("second fact")])
 
     def flaky(a, b):
-        if a == "second":
+        if a == "second fact":
             raise RuntimeError("down")
         return 0.0
 
-    e = FakeEmbedder({"first": [1, 0], "second": [0.9, 0.1]})
+    e = FakeEmbedder({"first fact": [1, 0], "second fact": [0.9, 0.1]})
     store.save(rec("seed"))
     e.vectors["seed"] = [1, 0.1]
     rep = ingest(store, FakeJudge(same_fact=flaky), e, TH, NOW)
     assert rep.jev_failed
     rep2 = ingest(store, FakeJudge(), e, TH, NOW)
     assert not rep2.jev_failed
-    assert sorted(r.body for r in store.load_all()) == ["first", "second", "seed"]
+    assert sorted(r.body for r in store.load_all()) == ["first fact", "second fact", "seed"]
 
 
 def test_same_fact_in_two_projects_stays_two_records(store):
@@ -284,3 +284,23 @@ def test_same_project_contradiction_still_supersedes_with_promoted_neighbour(sto
                                use_spaces=[0.9, 0.3]), TH, NOW)
     assert rep.superseded == [old.id]
     assert store.get(g.id).status == "active"
+
+
+def test_bare_candidate_dropped_without_judge_calls(store):
+    p = put(store, "s1.jsonl", [cand("Go", kind=None), cand("yes", kind="decision"),
+                                cand("1", kind="decision")])
+    j = Counting(classify_window=lambda t, c: WindowVerdict("decision", 0.9, 0.0))
+    rep = ingest(store, j, FakeEmbedder({}), TH, NOW)
+    assert j.calls == []
+    assert rep.skipped == 3 and not rep.created
+    assert store.load_all() == []
+    assert not p.exists()
+    assert (store.home / "inbox" / "processed" / "s1.jsonl").exists()
+
+
+def test_bare_with_reply_marker_and_non_bare_unaffected(store):
+    composed = "1 (in reply to: Which storage location?)"
+    put(store, "s1.jsonl", [cand(composed), cand("no em dashes")])
+    rep = ingest(store, FakeJudge(), FakeEmbedder({composed: [1, 0], "no em dashes": [0, 1]}),
+                 TH, NOW)
+    assert len(rep.created) == 2 and rep.skipped == 0
